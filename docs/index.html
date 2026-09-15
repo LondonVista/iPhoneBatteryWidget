@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>iPhone Battery Widget — Real-Time Battery & Thermal Dashboard for macOS</title>
+  <meta name="description" content="A lightweight, floating translucent desktop widget and battery health degradation dashboard for MacBooks, iPhones, and iPads." />
+  <link rel="canonical" href="https://londonvista.github.io/iPhoneBatteryWidget/" />
+  
+  <style>
+    :root {
+      --bg: #0b0d11;
+      --card-bg: rgba(22, 25, 33, 0.75);
+      --card-border: rgba(255, 255, 255, 0.1);
+      --text: #f0f3f8;
+      --muted: #8b949e;
+      --accent: #10b981;
+      --accent-glow: rgba(16, 185, 129, 0.25);
+      --cyan: #38bdf8;
+      --orange: #f59e0b;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      background-color: var(--bg);
+      background-image: 
+        radial-gradient(1200px 600px at 50% -10%, rgba(16, 185, 129, 0.15) 0%, transparent 60%),
+        radial-gradient(900px 500px at 80% 20%, rgba(56, 189, 248, 0.08) 0%, transparent 50%);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 60px 24px 100px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: #34d399;
+      font-size: 0.82rem;
+      font-weight: 600;
+      padding: 4px 12px;
+      border-radius: 999px;
+      margin-bottom: 20px;
+      letter-spacing: 0.02em;
+    }
+
+    .badge::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #34d399;
+      box-shadow: 0 0 8px #34d399;
+    }
+
+    h1 {
+      font-size: clamp(2.4rem, 6vw, 3.8rem);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1.1;
+      margin-bottom: 18px;
+    }
+
+    h1 span.gradient {
+      background: linear-gradient(135deg, #ffffff 30%, #34d399 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    p.lead {
+      color: var(--muted);
+      font-size: clamp(1.05rem, 2.5vw, 1.25rem);
+      max-width: 680px;
+      margin-bottom: 32px;
+      font-weight: 400;
+    }
+
+    .cta-row {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      margin-bottom: 48px;
+    }
+
+    a.btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 12px 22px;
+      border-radius: 12px;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    a.btn-primary {
+      background: #10b981;
+      color: #041b11;
+      box-shadow: 0 4px 20px var(--accent-glow);
+    }
+
+    a.btn-primary:hover {
+      background: #059669;
+      transform: translateY(-2px);
+      box-shadow: 0 6px 24px rgba(16, 185, 129, 0.35);
+    }
+
+    a.btn-secondary {
+      background: var(--card-bg);
+      color: var(--text);
+      border: 1px solid var(--card-border);
+      backdrop-filter: blur(12px);
+    }
+
+    a.btn-secondary:hover {
+      border-color: rgba(255, 255, 255, 0.25);
+      background: rgba(30, 35, 45, 0.85);
+      transform: translateY(-2px);
+    }
+
+    .showcase {
+      margin: 40px 0 60px;
+    }
+
+    .dashboard-preview {
+      width: 100%;
+      border-radius: 18px;
+      border: 1px solid var(--card-border);
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+      display: block;
+      margin-bottom: 24px;
+    }
+
+    .floating-preview-wrap {
+      display: flex;
+      justify-content: center;
+      margin: 32px 0 48px;
+    }
+
+    .floating-preview {
+      width: 100%;
+      max-width: 380px;
+      border-radius: 20px;
+      border: 1px solid var(--card-border);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 18px;
+      margin-top: 40px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 24px;
+      backdrop-filter: blur(16px);
+      transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+
+    .card:hover {
+      border-color: rgba(16, 185, 129, 0.35);
+      transform: translateY(-2px);
+    }
+
+    .card-icon {
+      font-size: 1.5rem;
+      margin-bottom: 12px;
+      display: inline-block;
+    }
+
+    .card h3 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      letter-spacing: -0.01em;
+    }
+
+    .card p {
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.6;
+    }
+
+    .code-box {
+      background: rgba(15, 17, 23, 0.9);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 16px 20px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.88rem;
+      color: #38bdf8;
+      overflow-x: auto;
+      margin: 20px 0;
+    }
+
+    footer {
+      margin-top: 80px;
+      padding-top: 24px;
+      border-top: 1px solid var(--card-border);
+      color: var(--muted);
+      font-size: 0.88rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    footer a {
+      color: var(--text);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+
+    footer a:hover {
+      color: #34d399;
+    }
+  </style>
+
+  <!-- Umami Analytics (Cloud / Self-Hosted) -->
+  <script>
+    window.IBW_UMAMI_WEBSITE_ID = "c1bd2214-158b-465c-8c55-3d01f0642917";
+  </script>
+  <script>
+    (function () {
+      var params = new URLSearchParams(location.search);
+      if (params.get("me") === "1" || params.get("nomine") === "1") {
+        try { localStorage.setItem("umami.disabled", "1"); } catch (e) {}
+      }
+      if (params.get("me") === "0") {
+        try { localStorage.removeItem("umami.disabled"); } catch (e) {}
+      }
+      try {
+        if (localStorage.getItem("umami.disabled")) return;
+      } catch (e) {}
+      if (window.IBW_UMAMI_WEBSITE_ID) {
+        var s = document.createElement("script");
+        s.defer = true;
+        s.src = "https://cloud.umami.is/script.js";
+        s.setAttribute("data-website-id", window.IBW_UMAMI_WEBSITE_ID);
+        document.head.appendChild(s);
+      }
+    })();
+  </script>
+</head>
+<body>
+  <main>
+    <div class="badge">macOS 13+ · Apple Silicon Native</div>
+    <h1>iPhone &amp; Mac Battery,<br /><span class="gradient">always in view.</span></h1>
+    <p class="lead">
+      A lightweight, translucent floating macOS desktop widget and deep battery analytics dashboard for MacBooks, iPhones, and iPads.
+    </p>
+
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/LondonVista/iPhoneBatteryWidget/releases">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+        Download .DMG
+      </a>
+      <a class="btn btn-secondary" href="https://github.com/LondonVista/iPhoneBatteryWidget">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"></path></svg>
+        GitHub Repository
+      </a>
+    </div>
+
+    <div class="showcase">
+      <img class="dashboard-preview" src="assets/dashboard-archive-preview.png" alt="Battery Degradation & Settings Dashboard" />
+      <div class="floating-preview-wrap">
+        <img class="floating-preview" src="assets/widget-floating-preview.png" alt="Glassmorphic Floating Widget" />
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="card-icon">⚡</div>
+        <h3>Live Dual-Device Tracking</h3>
+        <p>Real-time capacity, wattage, amperage, voltage, and accurate cycle counts for your Mac and connected iPhones or iPads simultaneously.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🌡️</div>
+        <h3>Hardware NTC Thermistor</h3>
+        <p>Direct live sensor temperatures with dynamic thermal gradient indicators, rate trends, and high-heat safety alerts.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">📈</div>
+        <h3>Degradation Trajectories</h3>
+        <p>Comprehensive historical analytics and multi-month battery capacity degradation curves with CSV export & coconutBattery archive import.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🔌</div>
+        <h3>Dual Connection Engine</h3>
+        <p>Native high-speed USB `usbmuxd` lockdown communication with seamless Wi-Fi sync fallback when disconnected from cable.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">💻</div>
+        <h3>Lid &amp; Session Tracker</h3>
+        <p>Monitors MacBook clamshell open/close cycles, active work sessions, and screen-on durations automatically.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">💎</div>
+        <h3>Glassmorphic Floating UI</h3>
+        <p>Always-on-top translucent dark glass design that docks anywhere on your screen and blends seamlessly with macOS.</p>
+      </div>
+    </div>
+
+    <h2 style="margin-top: 60px; font-size: 1.6rem; letter-spacing: -0.02em;">Quick Installation</h2>
+    <p style="color: var(--muted); margin: 8px 0 16px;">Download the pre-compiled DMG or build from source in seconds:</p>
+    
+    <div class="code-box">
+      git clone https://github.com/LondonVista/iPhoneBatteryWidget.git<br />
+      cd iPhoneBatteryWidget<br />
+      ./build.sh --release
+    </div>
+
+    <footer>
+      <span>Open Source MIT License · LondonVista</span>
+      <div>
+        <a href="https://github.com/LondonVista/iPhoneBatteryWidget">Source Code</a>
+      </div>
+    </footer>
+  </main>
+</body>
+</html>
