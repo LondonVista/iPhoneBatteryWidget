@@ -5,6 +5,7 @@ A lightweight, translucent floating macOS desktop widget and comprehensive batte
 ![macOS 13+](https://img.shields.io/badge/macOS-13.0%2B-blue)
 ![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Website](https://img.shields.io/badge/Website-Live%20Page-emerald)](https://londonvista.github.io/iPhoneBatteryWidget/)
 
 <p align="center">
   <img src="assets/dashboard-archive-preview.png" alt="iPhone Battery Widget Dashboard & Battery Degradation Archive" width="100%">
