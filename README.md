@@ -6,6 +6,14 @@ A lightweight, translucent floating macOS desktop widget and comprehensive batte
 ![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+<p align="center">
+  <img src="assets/dashboard-archive-preview.png" alt="iPhone Battery Widget Dashboard & Battery Degradation Archive" width="100%">
+</p>
+
+<p align="center">
+  <img src="assets/widget-floating-preview.png" alt="Floating Glassmorphic Desktop Widget" width="40%">
+</p>
+
 ---
 
 ## ✨ Features
