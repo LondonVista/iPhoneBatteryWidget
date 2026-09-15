@@ -1,0 +1,8 @@
+# Build output & compiled bundles
+*.app
+*.dmg
+.DS_Store
+.build/
+DerivedData/
+*.swp
+*.orig
