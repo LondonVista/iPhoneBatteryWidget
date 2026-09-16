@@ -3772,9 +3772,20 @@ struct ModernDataTableRowView: View {
     }
 
     private var nameText: String {
-        if let n = pt.deviceName { return n }
-        if pt.deviceId == "local_mac" || pt.deviceType == .mac { return "MacBook Air M1" }
-        return activeDeviceName ?? "iPhone"
+        if let n = pt.deviceName, !n.isEmpty {
+            let lower = n.lowercased()
+            if lower.contains("mac") {
+                return "MacBook Air"
+            }
+            if lower.contains("iphone") || lower.contains("17") {
+                return "J. iPhone 17 Pro"
+            }
+            return n
+        }
+        if pt.deviceId == "local_mac" || pt.deviceType == .mac || (pt.deviceModel?.lowercased().contains("mac") ?? false) {
+            return "MacBook Air"
+        }
+        return "J. iPhone 17 Pro"
     }
 
     private var serialText: String {
