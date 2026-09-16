@@ -7,16 +7,207 @@ import Compression
 
 // MARK: - Config & Storage Keys
 
+enum iPhoneBatteryWidgetConfig {
+    static let appVersion = "1.0.1"
+    static let donateURL = URL(string: "https://ko-fi.com/london_vista")
+    static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
+    static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
+}
+
+enum UpdatePolicy: String, CaseIterable {
+    case prompt = "prompt"
+    case auto   = "auto"
+    case off    = "off"
+}
+
+private func appVersionCompare(_ a: String, _ b: String) -> ComparisonResult {
+    let pa = a.split(separator: ".").compactMap { Int($0) }
+    let pb = b.split(separator: ".").compactMap { Int($0) }
+    let n = max(pa.count, pb.count)
+    for i in 0..<n {
+        let x = i < pa.count ? pa[i] : 0
+        let y = i < pb.count ? pb[i] : 0
+        if x > y { return .orderedDescending }
+        if x < y { return .orderedAscending }
+    }
+    return .orderedSame
+}
+
+struct UpdateReleaseInfo {
+    let version: String
+    let notes: String
+    let url: URL
+    let dmgURL: URL?
+}
+
+@MainActor
+final class AppUpdateChecker: ObservableObject {
+    static let shared = AppUpdateChecker()
+
+    @Published var isChecking: Bool = false
+    @Published var latestVersion: String? = nil
+    @Published var updateAvailable: Bool = false
+    @Published var statusMessage: String = "Up to date (v\(iPhoneBatteryWidgetConfig.appVersion))"
+    @Published var lastCheckedDate: Date? = nil
+
+    private init() {}
+
+    func checkSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+            self?.checkForUpdates(manual: false)
+        }
+    }
+
+    func checkForUpdates(manual: Bool = false) {
+        let policyRaw = UserDefaults.standard.string(forKey: "ibw.settings.updatePolicy") ?? "prompt"
+        let policy = UpdatePolicy(rawValue: policyRaw) ?? .prompt
+        if !manual && policy == .off { return }
+        guard !isChecking else { return }
+
+        isChecking = true
+        if manual {
+            statusMessage = "Checking for updates…"
+        }
+
+        Task {
+            let info = await Self.fetchLatestRelease()
+            await MainActor.run {
+                self.isChecking = false
+                self.lastCheckedDate = Date()
+                guard let info = info else {
+                    if manual {
+                        self.statusMessage = "Unable to check updates"
+                    }
+                    return
+                }
+
+                self.latestVersion = info.version
+                let isNewer = appVersionCompare(info.version, iPhoneBatteryWidgetConfig.appVersion) == .orderedDescending
+                self.updateAvailable = isNewer
+
+                if isNewer {
+                    self.statusMessage = "v\(info.version) available"
+                    if manual || policy == .prompt {
+                        self.showUpdateAlert(info: info)
+                    } else if policy == .auto {
+                        self.openDownload(url: info.dmgURL ?? info.url)
+                    }
+                } else {
+                    self.statusMessage = "Up to date (v\(iPhoneBatteryWidgetConfig.appVersion))"
+                    if manual {
+                        let alert = NSAlert()
+                        alert.messageText = "You're up to date!"
+                        alert.informativeText = "iPhone Battery Widget v\(iPhoneBatteryWidgetConfig.appVersion) is the latest version available."
+                        alert.alertStyle = .informational
+                        alert.addButton(withTitle: "OK")
+                        alert.runModal()
+                    }
+                }
+            }
+        }
+    }
+
+    func openDownload(url: URL? = nil) {
+        let target = url ?? iPhoneBatteryWidgetConfig.githubReleasesURL ?? URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases")!
+        NSWorkspace.shared.open(target)
+    }
+
+    private func showUpdateAlert(info: UpdateReleaseInfo) {
+        let alert = NSAlert()
+        alert.messageText = "iPhone Battery Widget v\(info.version) is Available!"
+        let notesText = info.notes.isEmpty ? "A new version of iPhone Battery Widget is available." : info.notes
+        alert.informativeText = "\(notesText)\n\nYou have v\(iPhoneBatteryWidgetConfig.appVersion). Would you like to download the update now?"
+        alert.addButton(withTitle: "Download Update")
+        alert.addButton(withTitle: "Later")
+        alert.alertStyle = .informational
+        let res = alert.runModal()
+        if res == .alertFirstButtonReturn {
+            openDownload(url: info.dmgURL ?? info.url)
+        }
+    }
+
+    private static func fetchLatestRelease() async -> UpdateReleaseInfo? {
+        guard let apiURL = iPhoneBatteryWidgetConfig.githubAPIURL else { return nil }
+        var req = URLRequest(url: apiURL)
+        req.setValue("iPhoneBatteryWidget/\(iPhoneBatteryWidgetConfig.appVersion)", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        guard let (data, res) = try? await URLSession.shared.data(for: req),
+              let http = res as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        let tag = ((json["tag_name"] as? String) ?? "").replacingOccurrences(of: "v", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tag.isEmpty else { return nil }
+        let notes = json["body"] as? String ?? ""
+        var downloadURL: URL? = nil
+        if let assets = json["assets"] as? [[String: Any]] {
+            let dmg = assets.first { (($0["name"] as? String) ?? "").lowercased().hasSuffix(".dmg") }
+            if let s = dmg?["browser_download_url"] as? String {
+                downloadURL = URL(string: s)
+            }
+        }
+        let htmlUrl = (json["html_url"] as? String).flatMap { URL(string: $0) } ?? iPhoneBatteryWidgetConfig.githubReleasesURL!
+        return UpdateReleaseInfo(version: tag, notes: notes, url: htmlUrl, dmgURL: downloadURL)
+    }
+}
+
 private let kAppBundleID = "com.londonvista.iPhoneBatteryWidget"
 private let kFrameOriginX = "ibw.frameOriginX"
 private let kFrameTopY    = "ibw.frameTopY"
 private let kCachedDevicesKey = "ibw.cachedDevicesData.v2"
 private let kHistoryLogKey = "ibw.batteryHistoryLog.v2"
+private let kLidHistoryLogKey = "ibw.lidHistoryLog.v1"
 private let kSelectedTabKey = "ibw.selectedDeviceTab"
 private let kPollInterval: TimeInterval = 2.0
 private let kIOSPollInterval: TimeInterval = 3.0
 
-// MARK: - Privacy & Device Name Sanitizer
+// MARK: - Privacy & Standardized Device Name Resolver
+
+func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: String? = nil, deviceType: DeviceType? = nil) -> String {
+    if let n = name, !n.isEmpty {
+        let lower = n.lowercased()
+        if lower.contains("mac") {
+            return "MacBook Air"
+        }
+        if lower.contains("15") && (lower.contains("iphone") || lower.contains("old")) {
+            return "iPhone 15"
+        }
+        if lower.contains("iphone") || lower.contains("17") {
+            return "J. iPhone 17 Pro"
+        }
+        return cleanDeviceDisplayName(n, fallback: "iPhone")
+    }
+    if deviceId == "local_mac" || deviceType == .mac || (model?.lowercased().contains("mac") ?? false) {
+        return "MacBook Air"
+    }
+    if (deviceId?.contains("26cc71869") ?? false) || (model?.contains("15") ?? false) {
+        return "iPhone 15"
+    }
+    return "J. iPhone 17 Pro"
+}
+
+func canonicalDeviceModelName(model: String?, name: String? = nil, deviceId: String? = nil, deviceType: DeviceType? = nil) -> String {
+    if let m = model, !m.isEmpty {
+        let lower = m.lowercased()
+        if lower.contains("18,1") || lower.contains("17") || (lower.contains("iphone") && !lower.contains("15") && !lower.contains("mac")) {
+            return "iPhone18,1"
+        }
+        if lower.contains("mac") || lower.contains("macbookair10") {
+            return "MacBookAir10,1"
+        }
+        if lower.contains("15") {
+            return "iPhone15,4"
+        }
+        return m
+    }
+    if deviceId == "local_mac" || deviceType == .mac || (name?.lowercased().contains("mac") ?? false) {
+        return "MacBookAir10,1"
+    }
+    if (deviceId?.contains("26cc71869") ?? false) || (name?.contains("15") ?? false) {
+        return "iPhone15,4"
+    }
+    return "iPhone18,1"
+}
 
 func cleanDeviceDisplayName(_ raw: String?, fallback: String = "iPhone") -> String {
     guard let raw = raw, !raw.isEmpty else { return fallback }
@@ -301,7 +492,7 @@ enum TemperatureTrend: String, Codable {
 struct DeviceBatteryData: Codable, Identifiable, Equatable {
     var id: String { deviceId }
     let deviceId: String          // UDID or Mac UUID
-    let deviceName: String
+    var deviceName: String
     let deviceType: DeviceType
     let isConnected: Bool
     let isWirelesslyConnected: Bool
@@ -735,7 +926,7 @@ enum MacBatteryReader {
 
         return DeviceBatteryData(
             deviceId: "local_mac",
-            deviceName: ident.hostName,
+            deviceName: canonicalDeviceDisplayName(name: ident.hostName, model: ident.hwModelName, deviceId: "local_mac", deviceType: .mac),
             deviceType: .mac,
             isConnected: true,
             isWirelesslyConnected: false,
@@ -1347,7 +1538,7 @@ run()
 
         return DeviceBatteryData(
             deviceId: info.udid ?? udid,
-            deviceName: cleanDeviceDisplayName(info.deviceName, fallback: "iPhone"),
+            deviceName: canonicalDeviceDisplayName(name: info.deviceName, model: hwMarketing, deviceId: info.udid ?? udid, deviceType: dType),
             deviceType: dType,
             isConnected: true,
             isWirelesslyConnected: info.isNetwork ?? true,
@@ -1617,7 +1808,7 @@ run()
 
         return DeviceBatteryData(
             deviceId: udid,
-            deviceName: deviceName,
+            deviceName: canonicalDeviceDisplayName(name: deviceName, model: hardwareModelName, deviceId: udid, deviceType: deviceType),
             deviceType: deviceType,
             isConnected: true,
             isWirelesslyConnected: isNetwork,
@@ -1680,8 +1871,8 @@ struct LidSession: Identifiable, Codable, Equatable {
 
 final class MacLidTracker {
     static let shared = MacLidTracker()
-    
-    func fetchTodayLidSessions() -> (firstOpen: Date?, sessions: [LidSession]) {
+
+    func fetchAllLidSessions() -> [LidSession] {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
         proc.arguments = ["-g", "log"]
@@ -1691,40 +1882,32 @@ final class MacLidTracker {
         do {
             try proc.run()
         } catch {
-            return (nil, [])
+            return []
         }
-        
+
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
         guard let output = String(data: data, encoding: .utf8) else {
-            return (nil, [])
+            return []
         }
-        
-        let cal = Calendar.current
-        let today = Date()
-        let todayYear = cal.component(.year, from: today)
-        let todayMonth = cal.component(.month, from: today)
-        let todayDay = cal.component(.day, from: today)
-        let prefix = String(format: "%04d-%02d-%02d", todayYear, todayMonth, todayDay)
-        
+
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss"
         df.timeZone = TimeZone.current
-        
+
         var rawOpens: [Date] = []
         var rawCloses: [Date] = []
-        
+
         for line in output.components(separatedBy: "\n") {
-            guard line.hasPrefix(prefix) else { continue }
             guard line.count >= 19 else { continue }
             let dateStr = String(line.prefix(19))
             guard let dt = df.date(from: dateStr) else { continue }
-            
+
             let isOpen = line.contains("Created UserIsActive \"com.apple.powermanagement.lidopen\"") ||
                          (line.contains("Wake") && (line.localizedCaseInsensitiveContains("lid") || line.contains("UserActivity")) && !line.contains("DarkWake"))
             let isClose = line.contains("Entering Sleep state due to 'Clamshell Sleep'") ||
                           (line.contains("Entering Sleep") && !rawOpens.isEmpty && !line.contains("Maintenance") && !line.contains("Sleep Service"))
-            
+
             if isOpen {
                 if let last = rawOpens.last, abs(dt.timeIntervalSince(last)) < 30 {
                     continue
@@ -1737,23 +1920,21 @@ final class MacLidTracker {
                 rawCloses.append(dt)
             }
         }
-        
+
         if rawOpens.isEmpty {
             var bootTime = timeval()
             var size = MemoryLayout<timeval>.stride
             var mib = [CTL_KERN, KERN_BOOTTIME]
             if sysctl(&mib, 2, &bootTime, &size, nil, 0) == 0 {
                 let bDate = Date(timeIntervalSince1970: TimeInterval(bootTime.tv_sec))
-                if cal.isDateInToday(bDate) {
-                    rawOpens.append(bDate)
-                }
+                rawOpens.append(bDate)
             }
         }
-        
+
         guard !rawOpens.isEmpty else {
-            return (nil, [])
+            return []
         }
-        
+
         var sessions: [LidSession] = []
         for (idx, op) in rawOpens.enumerated() {
             let nextOp = (idx + 1 < rawOpens.count) ? rawOpens[idx + 1] : nil
@@ -1761,8 +1942,16 @@ final class MacLidTracker {
             let cl = validCloses.first
             sessions.append(LidSession(openDate: op, closeDate: cl))
         }
-        
-        return (rawOpens.first, sessions)
+
+        return sessions.sorted(by: { $0.openDate > $1.openDate })
+    }
+
+    func fetchTodayLidSessions() -> (firstOpen: Date?, sessions: [LidSession]) {
+        let cal = Calendar.current
+        let all = fetchAllLidSessions()
+        let todaySessions = all.filter { cal.isDateInToday($0.openDate) }
+        let firstOpen = todaySessions.min(by: { $0.openDate < $1.openDate })?.openDate
+        return (firstOpen, todaySessions)
     }
 }
 
@@ -1821,8 +2010,17 @@ final class BatteryWidgetViewModel: ObservableObject {
             UserDefaults.standard.set(pdSoundTheme, forKey: "ibw.sound.pdDisconnect")
         }
     }
+    @Published var updatePolicy: UpdatePolicy = {
+        let raw = UserDefaults.standard.string(forKey: "ibw.settings.updatePolicy") ?? "prompt"
+        return UpdatePolicy(rawValue: raw) ?? .prompt
+    }() {
+        didSet {
+            UserDefaults.standard.set(updatePolicy.rawValue, forKey: "ibw.settings.updatePolicy")
+        }
+    }
     @Published var firstLidOpenToday: Date? = nil
     @Published var todayLidSessions: [LidSession] = []
+    @Published var allLidSessions: [LidSession] = []
 
     private var recentSamples: [String: [(date: Date, cap: Double, isCharging: Bool)]] = [:]
     private var recentTempSamples: [String: [(date: Date, temp: Double)]] = [:]
@@ -1865,6 +2063,7 @@ final class BatteryWidgetViewModel: ObservableObject {
         refresh()
         refreshLidSessions()
         startTimer()
+        AppUpdateChecker.shared.checkSoon()
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
@@ -1889,10 +2088,33 @@ final class BatteryWidgetViewModel: ObservableObject {
 
     func refreshLidSessions() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let (firstOpen, sessions) = MacLidTracker.shared.fetchTodayLidSessions()
+            guard let self else { return }
+            let cal = Calendar.current
+            let freshSessions = MacLidTracker.shared.fetchAllLidSessions()
+            
             DispatchQueue.main.async {
-                self?.firstLidOpenToday = firstOpen
-                self?.todayLidSessions = sessions
+                // Merge freshSessions into persisted allLidSessions without duplicating
+                var map: [String: LidSession] = [:]
+                for s in self.allLidSessions {
+                    map[s.id] = s
+                }
+                for s in freshSessions {
+                    map[s.id] = s
+                }
+                let merged = Array(map.values).sorted(by: { $0.openDate > $1.openDate })
+                self.allLidSessions = merged
+                self.todayLidSessions = merged.filter { cal.isDateInToday($0.openDate) }
+                self.firstLidOpenToday = self.todayLidSessions.min(by: { $0.openDate < $1.openDate })?.openDate
+                self.saveLidSessions()
+            }
+        }
+    }
+
+    private func saveLidSessions() {
+        let sessions = allLidSessions
+        Task.detached(priority: .background) {
+            if let data = try? JSONEncoder().encode(sessions) {
+                UserDefaults.standard.set(data, forKey: kLidHistoryLogKey)
             }
         }
     }
@@ -1993,6 +2215,13 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
         if let s = UserDefaults.standard.string(forKey: "ibw.sound.pdDisconnect") {
             pdSoundTheme = s
+        }
+        if let data = UserDefaults.standard.data(forKey: kLidHistoryLogKey),
+           let savedSessions = try? JSONDecoder().decode([LidSession].self, from: data) {
+            self.allLidSessions = savedSessions
+            let cal = Calendar.current
+            self.todayLidSessions = savedSessions.filter { cal.isDateInToday($0.openDate) }
+            self.firstLidOpenToday = self.todayLidSessions.min(by: { $0.openDate < $1.openDate })?.openDate
         }
     }
 
@@ -2219,7 +2448,7 @@ final class BatteryWidgetViewModel: ObservableObject {
 
                 let synthDev = DeviceBatteryData(
                     deviceId: last17?.deviceId ?? "DJRXC6F3QC",
-                    deviceName: cleanDeviceDisplayName(last17?.deviceName, fallback: "iPhone 17 Pro"),
+                    deviceName: canonicalDeviceDisplayName(name: last17?.deviceName, model: last17?.deviceModel, deviceId: last17?.deviceId ?? "DJRXC6F3QC", deviceType: .iphone),
                     deviceType: .iphone,
                     isConnected: false,
                     isWirelesslyConnected: false,
@@ -3749,43 +3978,11 @@ struct ModernDataTableRowView: View {
     }
 
     private var modelText: String {
-        if let m = pt.deviceModel, !m.isEmpty {
-            let lower = m.lowercased()
-            if lower.contains("18,1") || lower.contains("17") || (lower.contains("iphone") && !lower.contains("15") && !lower.contains("mac")) {
-                return "iPhone18,1"
-            }
-            if lower.contains("mac") || lower.contains("macbookair10") {
-                return "MacBookAir10,1"
-            }
-            if lower.contains("15") {
-                return "iPhone15,4"
-            }
-            return m
-        }
-        if pt.deviceId == "local_mac" || pt.deviceType == .mac || (pt.deviceName?.lowercased().contains("mac") ?? false) {
-            return "MacBookAir10,1"
-        }
-        if pt.deviceId.contains("26cc71869") || (pt.deviceName?.contains("15") ?? false) {
-            return "iPhone15,4"
-        }
-        return "iPhone18,1"
+        canonicalDeviceModelName(model: pt.deviceModel ?? activeDeviceModel, name: pt.deviceName ?? activeDeviceName, deviceId: pt.deviceId, deviceType: pt.deviceType)
     }
 
     private var nameText: String {
-        if let n = pt.deviceName, !n.isEmpty {
-            let lower = n.lowercased()
-            if lower.contains("mac") {
-                return "MacBook Air"
-            }
-            if lower.contains("iphone") || lower.contains("17") {
-                return "J. iPhone 17 Pro"
-            }
-            return n
-        }
-        if pt.deviceId == "local_mac" || pt.deviceType == .mac || (pt.deviceModel?.lowercased().contains("mac") ?? false) {
-            return "MacBook Air"
-        }
-        return "J. iPhone 17 Pro"
+        canonicalDeviceDisplayName(name: pt.deviceName ?? activeDeviceName, model: pt.deviceModel ?? activeDeviceModel, deviceId: pt.deviceId, deviceType: pt.deviceType)
     }
 
     private var serialText: String {
@@ -4052,12 +4249,13 @@ struct BatteryHistoryChartView: View {
     @Environment(\.dismiss) var dismiss
 
     enum HistTab: String, CaseIterable {
-        case graph     = "Charts & Health"
-        case tempChart = "Daily Temperature"
-        case lidSessions = "Lid Sessions"
-        case monthly   = "Monthly Evolution"
-        case allRows   = "Snapshot Database"
-        case settings  = "Settings"
+        case graph        = "Charts & Health"
+        case tempChart    = "Daily Temperature"
+        case lidSessions  = "Lid Sessions"
+        case monthly      = "Monthly Evolution"
+        case allRows      = "Snapshot Database"
+        case soundAndLook = "Sound & Look"
+        case updates      = "Software Updates"
     }
 
     enum TempChartSection: String, CaseIterable {
@@ -4068,8 +4266,18 @@ struct BatteryHistoryChartView: View {
         case all       = "All History"
     }
 
+    enum LidSessionSection: String, CaseIterable {
+        case today     = "Today"
+        case yesterday = "Yesterday"
+        case last7     = "Last 7 Days"
+        case last30    = "Last 30 Days"
+        case lastYear  = "Past Year"
+        case all       = "All History"
+    }
+
     @State private var selectedTempSection: TempChartSection = .today
     @State private var selectedCustomDateKey: String? = nil
+    @State private var selectedLidSection: LidSessionSection = .today
 
     init(vm: BatteryWidgetViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
@@ -4088,19 +4296,23 @@ struct BatteryHistoryChartView: View {
         
         // 1. All live / online devices (strictly 1 Mac and 1 iPhone 17 Pro)
         for dev in vm.devices {
+            let canonName = canonicalDeviceDisplayName(name: dev.deviceName, model: dev.hardwareModel, deviceId: dev.deviceId, deviceType: dev.deviceType)
+            var normalizedDev = dev
+            normalizedDev.deviceName = canonName
+
             let isPhone17 = dev.deviceType != .mac && !dev.deviceId.contains("26cc71869") && !dev.deviceName.contains("15")
             let isMac = dev.deviceType == .mac || dev.deviceId == "local_mac"
             
             if isMac {
                 if !list.contains(where: { $0.deviceType == .mac || $0.deviceId == "local_mac" }) {
-                    list.append(dev)
+                    list.append(normalizedDev)
                 }
             } else if isPhone17 {
                 if !list.contains(where: { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") && !$0.deviceName.contains("15") }) {
-                    list.append(dev)
+                    list.append(normalizedDev)
                 }
             } else if !list.contains(where: { $0.id == dev.id || $0.deviceId == dev.deviceId }) {
-                list.append(dev)
+                list.append(normalizedDev)
             }
         }
         
@@ -4128,10 +4340,11 @@ struct BatteryHistoryChartView: View {
             let cap = lastPt.batteryPct
             let fcc = lastPt.fullChargeMah
             let remMah = (fcc != nil) ? Int((cap / 100.0) * Double(fcc!)) : lastPt.capacityMah
+            let canonName = canonicalDeviceDisplayName(name: lastPt.deviceName, model: lastPt.deviceModel, deviceId: lastPt.deviceId, deviceType: devType)
             
             list.append(DeviceBatteryData(
                 deviceId: lastPt.deviceId,
-                deviceName: cleanDeviceDisplayName(lastPt.deviceName, fallback: devType == .mac ? "MacBook Air M1" : "iPhone"),
+                deviceName: canonName,
                 deviceType: devType,
                 isConnected: false,
                 isWirelesslyConnected: false,
@@ -4378,20 +4591,13 @@ struct BatteryHistoryChartView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text("Settings & Battery Archive")
-                            .font(.system(size: 14, weight: .bold, design: .rounded))
-                            .foregroundColor(.white)
-                        if let dev = activeDevice {
-                            Text("• \(dev.deviceName)")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundColor(.white.opacity(0.65))
-                        }
-                    }
-                    Text("\(allMatchedSorted.count) snapshots indexed • Auto-synced across logs")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.45))
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("Settings")
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                    Text("v\(iPhoneBatteryWidgetConfig.appVersion)")
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.4))
                 }
                 
                 Spacer()
@@ -4474,11 +4680,11 @@ struct BatteryHistoryChartView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 5) {
                                     Image(systemName: dev.deviceType.iconName)
-                                        .font(.system(size: 10, weight: .bold))
+                                        .font(.system(size: 11, weight: .bold))
                                         .foregroundColor(selectedDevId == dev.id ? .white : .white.opacity(0.75))
                                     Text(dev.deviceName)
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundColor(selectedDevId == dev.id ? .white : .white.opacity(0.85))
+                                        .font(.system(size: 12, weight: .bold))
+                                        .foregroundColor(selectedDevId == dev.id ? .white : .white.opacity(0.90))
                                         .lineLimit(1)
                                         .fixedSize(horizontal: true, vertical: false)
                                 }
@@ -4559,9 +4765,15 @@ struct BatteryHistoryChartView: View {
                             .padding(.horizontal, 18)
                             .padding(.bottom, 18)
                     }
-                case .settings:
+                case .soundAndLook:
                     ScrollView(.vertical, showsIndicators: true) {
-                        settingsView
+                        soundAndLookView
+                            .padding(.horizontal, 18)
+                            .padding(.bottom, 18)
+                    }
+                case .updates:
+                    ScrollView(.vertical, showsIndicators: true) {
+                        softwareUpdatesView
                             .padding(.horizontal, 18)
                             .padding(.bottom, 18)
                     }
@@ -5030,7 +5242,8 @@ struct BatteryHistoryChartView: View {
     @ViewBuilder
     private var monthlyView: some View {
         if let dev = activeDevice {
-            let modelName: String = dev.hardwareModel ?? (dev.deviceType == .mac ? "MacBook Air" : "iPhone")
+            let modelName: String = canonicalDeviceModelName(model: dev.hardwareModel, name: dev.deviceName, deviceId: dev.deviceId, deviceType: dev.deviceType)
+            let devDisplayName: String = canonicalDeviceDisplayName(name: dev.deviceName, model: dev.hardwareModel, deviceId: dev.deviceId, deviceType: dev.deviceType)
             VStack(spacing: 0) {
                 // Header row
                 HStack(spacing: 0) {
@@ -5049,7 +5262,7 @@ struct BatteryHistoryChartView: View {
 
                 // Subheader
                 HStack {
-                    Text("\(dev.deviceName) • \(modelName)")
+                    Text("\(devDisplayName) • \(modelName)")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundColor(.white.opacity(0.6))
                     Spacer()
@@ -5432,28 +5645,94 @@ struct BatteryHistoryChartView: View {
 
     // MARK: - Lid Sessions History Tab
 
+    private var filteredLidSessions: [LidSession] {
+        let cal = Calendar.current
+        let now = Date()
+        let all = vm.allLidSessions.isEmpty ? vm.todayLidSessions : vm.allLidSessions
+
+        switch selectedLidSection {
+        case .today:
+            return all.filter { cal.isDateInToday($0.openDate) }
+        case .yesterday:
+            return all.filter { cal.isDateInYesterday($0.openDate) }
+        case .last7:
+            let start = cal.date(byAdding: .day, value: -7, to: now) ?? now
+            return all.filter { $0.openDate >= start }
+        case .last30:
+            let start = cal.date(byAdding: .day, value: -30, to: now) ?? now
+            return all.filter { $0.openDate >= start }
+        case .lastYear:
+            let start = cal.date(byAdding: .year, value: -1, to: now) ?? now
+            return all.filter { $0.openDate >= start }
+        case .all:
+            return all
+        }
+    }
+
     @ViewBuilder
     private var lidSessionsFullView: some View {
         VStack(spacing: 12) {
+            lidSectionTabBar
             lidSessionsSummaryCards
             lidSessionsTable
         }
     }
 
+    private var lidSectionTabBar: some View {
+        HStack(spacing: 6) {
+            ForEach(LidSessionSection.allCases, id: \.self) { sec in
+                lidSectionButton(section: sec, isSelected: selectedLidSection == sec)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func lidSectionButton(section: LidSessionSection, isSelected: Bool) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                self.selectedLidSection = section
+            }
+        } label: {
+            Text(section.rawValue)
+                .font(.system(size: 11, weight: isSelected ? .bold : .medium, design: .rounded))
+                .foregroundColor(isSelected ? Color.white : Color.white.opacity(0.6))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    isSelected ?
+                        Color(hex: "#0A84FF").opacity(0.28) :
+                        Color.white.opacity(0.04)
+                )
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule()
+                        .stroke(isSelected ? Color(hex: "#0A84FF").opacity(0.7) : Color.white.opacity(0.08), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
     private var lidSessionsSummaryCards: some View {
-        HStack(spacing: 12) {
+        let list = filteredLidSessions
+        let firstOpen = list.min(by: { $0.openDate < $1.openDate })?.openDate
+        let sec = Int(list.reduce(0) { $0 + $1.durationSeconds })
+        let h = sec / 3600
+        let m = (sec % 3600) / 60
+
+        return HStack(spacing: 12) {
             // Card 1: First Lid Open
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 4) {
                     Image(systemName: "sunrise.fill")
                         .font(.system(size: 10))
                         .foregroundColor(Color(hex: "#FF9F0A"))
-                    Text("First Lid Open Today")
+                    Text(selectedLidSection == .today ? "First Open Today" : "Earliest Open")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.white.opacity(0.55))
                 }
-                Text(vm.firstLidOpenToday != nil ? formatTimeFull(vm.firstLidOpenToday!) : "--:--:--")
-                    .font(.system(size: 15, weight: .bold, design: .monospaced))
+                Text(firstOpen != nil ? (selectedLidSection == .today || selectedLidSection == .yesterday ? formatTimeFull(firstOpen!) : formatDateCoconut(firstOpen!)) : "--:--:--")
+                    .font(.system(size: 14, weight: .bold, design: .monospaced))
                     .foregroundColor(.white)
             }
             .padding(12)
@@ -5472,9 +5751,6 @@ struct BatteryHistoryChartView: View {
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.white.opacity(0.55))
                 }
-                let sec = Int(vm.todayLidSessions.reduce(0) { $0 + $1.durationSeconds })
-                let h = sec / 3600
-                let m = (sec % 3600) / 60
                 Text(h > 0 ? "\(h)h \(m)m" : "\(m)m")
                     .font(.system(size: 15, weight: .bold, design: .monospaced))
                     .foregroundColor(Color(hex: "#30D158"))
@@ -5491,11 +5767,11 @@ struct BatteryHistoryChartView: View {
                     Image(systemName: "laptopcomputer")
                         .font(.system(size: 10))
                         .foregroundColor(Color(hex: "#0A84FF"))
-                    Text("Today's Sessions")
+                    Text("\(selectedLidSection.rawValue) Sessions")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.white.opacity(0.55))
                 }
-                Text("\(vm.todayLidSessions.count) sessions")
+                Text("\(list.count) session\(list.count == 1 ? "" : "s")")
                     .font(.system(size: 15, weight: .bold, design: .monospaced))
                     .foregroundColor(.white)
             }
@@ -5508,17 +5784,20 @@ struct BatteryHistoryChartView: View {
     }
 
     private var lidSessionsTable: some View {
-        VStack(spacing: 0) {
+        let list = filteredLidSessions
+        let isMultiDay = selectedLidSection != .today && selectedLidSection != .yesterday
+
+        return VStack(spacing: 0) {
             HStack(spacing: 0) {
                 Text("Session")
                     .font(.system(size: 11, weight: .bold)).foregroundColor(.white.opacity(0.75))
-                    .frame(width: 80, alignment: .leading).padding(.leading, 14)
+                    .frame(width: isMultiDay ? 120 : 80, alignment: .leading).padding(.leading, 14)
                 Text("Lid Opened")
                     .font(.system(size: 11, weight: .bold)).foregroundColor(.white.opacity(0.75))
-                    .frame(width: 140, alignment: .leading)
+                    .frame(width: isMultiDay ? 150 : 140, alignment: .leading)
                 Text("Lid Closed")
                     .font(.system(size: 11, weight: .bold)).foregroundColor(.white.opacity(0.75))
-                    .frame(width: 140, alignment: .leading)
+                    .frame(width: isMultiDay ? 150 : 140, alignment: .leading)
                 Text("Duration")
                     .font(.system(size: 11, weight: .bold)).foregroundColor(.white.opacity(0.75))
                     .frame(width: 110, alignment: .leading)
@@ -5532,12 +5811,12 @@ struct BatteryHistoryChartView: View {
 
             Divider().background(Color.white.opacity(0.08))
 
-            if vm.todayLidSessions.isEmpty {
+            if list.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "laptopcomputer")
                         .font(.system(size: 24))
                         .foregroundColor(.white.opacity(0.2))
-                    Text("No lid sessions logged for today yet.")
+                    Text("No lid sessions found for \(selectedLidSection.rawValue.lowercased()).")
                         .font(.system(size: 12))
                         .foregroundColor(.white.opacity(0.4))
                 }
@@ -5545,8 +5824,8 @@ struct BatteryHistoryChartView: View {
                 .padding(.vertical, 36)
             } else {
                 VStack(spacing: 0) {
-                    ForEach(Array(vm.todayLidSessions.enumerated()), id: \.element.id) { idx, session in
-                        lidSessionRow(idx: idx, session: session)
+                    ForEach(Array(list.enumerated()), id: \.element.id) { idx, session in
+                        lidSessionRow(idx: idx, session: session, isMultiDay: isMultiDay)
                     }
                 }
             }
@@ -5556,23 +5835,23 @@ struct BatteryHistoryChartView: View {
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
     }
 
-    private func lidSessionRow(idx: Int, session: LidSession) -> some View {
+    private func lidSessionRow(idx: Int, session: LidSession, isMultiDay: Bool) -> some View {
         HStack(spacing: 0) {
             Text("#\(idx + 1)")
                 .font(.system(size: 11, weight: .bold, design: .monospaced))
                 .foregroundColor(.white.opacity(0.85))
-                .frame(width: 80, alignment: .leading)
+                .frame(width: isMultiDay ? 120 : 80, alignment: .leading)
                 .padding(.leading, 14)
 
-            Text(formatTimeFull(session.openDate))
+            Text(isMultiDay ? formatDateCoconut(session.openDate) : formatTimeFull(session.openDate))
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundColor(.white.opacity(0.9))
-                .frame(width: 140, alignment: .leading)
+                .frame(width: isMultiDay ? 150 : 140, alignment: .leading)
 
-            Text(session.closeDate != nil ? formatTimeFull(session.closeDate!) : "Currently Active")
+            Text(session.closeDate != nil ? (isMultiDay ? formatDateCoconut(session.closeDate!) : formatTimeFull(session.closeDate!)) : "Currently Active")
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundColor(session.isActive ? Color(hex: "#30D158") : .white.opacity(0.7))
-                .frame(width: 140, alignment: .leading)
+                .frame(width: isMultiDay ? 150 : 140, alignment: .leading)
 
             Text(session.durationString)
                 .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -5599,14 +5878,23 @@ struct BatteryHistoryChartView: View {
         )
     }
 
-    // MARK: - Consolidated Settings Tab
+    // MARK: - Sound & Look Tab
 
     @ViewBuilder
-    private var settingsView: some View {
+    private var soundAndLookView: some View {
         VStack(spacing: 16) {
             settingsAppearanceCard
             settingsAudioCard
             settingsDatabaseCard
+        }
+    }
+
+    // MARK: - Software Updates Tab
+
+    @ViewBuilder
+    private var softwareUpdatesView: some View {
+        VStack(spacing: 16) {
+            settingsUpdatesCard
         }
     }
 
@@ -6071,6 +6359,118 @@ struct BatteryHistoryChartView: View {
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
     }
 
+    @ObservedObject private var updateChecker = AppUpdateChecker.shared
+
+    private var settingsUpdatesCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(Color(hex: "#0A84FF"))
+                Text("App Version & Software Updates")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(.white)
+                Spacer()
+                Text("v\(iPhoneBatteryWidgetConfig.appVersion)")
+                    .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                    .foregroundColor(Color(hex: "#0A84FF"))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color(hex: "#0A84FF").opacity(0.14))
+                    .clipShape(Capsule())
+            }
+
+            // Update Policy & Status
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Update Mode")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Choose how new widget releases and improvements are delivered")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+
+                    Picker("", selection: $vm.updatePolicy) {
+                        Text("Prompt When Available").tag(UpdatePolicy.prompt)
+                        Text("Automatic Download").tag(UpdatePolicy.auto)
+                        Text("Manual Check Only").tag(UpdatePolicy.off)
+                    }
+                    .pickerStyle(MenuPickerStyle())
+                    .frame(width: 175)
+                }
+
+                Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            if updateChecker.isChecking {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(width: 12, height: 12)
+                            } else if updateChecker.updateAvailable {
+                                Circle().fill(Color(hex: "#30D158")).frame(width: 6, height: 6)
+                            } else {
+                                Circle().fill(Color.white.opacity(0.4)).frame(width: 6, height: 6)
+                            }
+                            Text(updateChecker.statusMessage)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(updateChecker.updateAvailable ? Color(hex: "#30D158") : .white.opacity(0.7))
+                        }
+                        if let lastCheck = updateChecker.lastCheckedDate {
+                            Text("Last checked: \(formatDateCoconut(lastCheck))")
+                                .font(.system(size: 9.5))
+                                .foregroundColor(.white.opacity(0.4))
+                        }
+                    }
+
+                    Spacer()
+
+                    if updateChecker.updateAvailable {
+                        Button(action: { updateChecker.openDownload() }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.down.circle.fill")
+                                Text("Download v\(updateChecker.latestVersion ?? "")")
+                            }
+                            .font(.system(size: 10.5, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4.5)
+                            .background(Color(hex: "#30D158"))
+                            .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Button(action: {
+                        updateChecker.checkForUpdates(manual: true)
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 9, weight: .bold))
+                            Text(updateChecker.isChecking ? "Checking…" : "Check for Updates")
+                                .font(.system(size: 10.5, weight: .semibold))
+                        }
+                        .foregroundColor(Color(hex: "#0A84FF"))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4.5)
+                        .background(Color(hex: "#0A84FF").opacity(0.14))
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(updateChecker.isChecking)
+                }
+            }
+        }
+        .padding(14)
+        .background(Color.white.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
+    }
+
     // MARK: - Helpers
 
     private func healthColor(_ h: Double) -> Color {
@@ -6380,17 +6780,17 @@ struct DeviceGridCardView: View {
     }
 
     private var deviceNameRow: some View {
-        HStack(spacing: 4.5) {
+        HStack(spacing: 5) {
             Image(systemName: dev.deviceType.iconName)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundColor(.white.opacity(0.75))
-            Text(dev.deviceName)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundColor(.white.opacity(0.92))
+                .font(.system(size: 11.5, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            Text(canonicalDeviceDisplayName(name: dev.deviceName, model: dev.hardwareModel, deviceId: dev.deviceId, deviceType: dev.deviceType))
+                .font(.system(size: 13, weight: .bold))
+                .foregroundColor(.white.opacity(0.95))
                 .lineLimit(1)
             if dev.isWirelesslyConnected && dev.deviceType != .iphone && !dev.deviceName.lowercased().contains("iphone") {
                 Image(systemName: "wifi")
-                    .font(.system(size: 8))
+                    .font(.system(size: 8.5))
                     .foregroundColor(.white.opacity(0.75))
             }
             Spacer()
@@ -6402,11 +6802,11 @@ struct DeviceGridCardView: View {
             Spacer()
             if dev.isCharging {
                 Image(systemName: "bolt.fill")
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: 15, weight: .bold))
                     .foregroundColor(Color(hex: "#30D158"))
             }
             Text(String(format: "%.1f%%", dev.capacityExact))
-                .font(.system(size: 18, weight: .heavy, design: .rounded))
+                .font(.system(size: 22, weight: .heavy, design: .rounded))
                 .foregroundColor(capacityColor(dev.capacityExact, isCharging: dev.isCharging, isMac: isMac))
         }
     }
