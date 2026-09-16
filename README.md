@@ -18,6 +18,16 @@ A lightweight, translucent floating macOS desktop widget and comprehensive batte
 
 ---
 
+## 📥 Download
+
+Latest release: **[v1.0.0](https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest)**
+
+| Platform | Format | Size | Download Link |
+| :--- | :--- | :--- | :--- |
+| 🍏 **macOS (Apple Silicon)** | `.dmg` Installer | 2.7 MB | **[⬇️ Download iPhoneBatteryWidget-Installer.dmg](https://github.com/LondonVista/iPhoneBatteryWidget/releases/download/v1.0.0/iPhoneBatteryWidget-Installer.dmg)** |
+
+---
+
 ## ✨ Features
 
 - **Live Multi-Device Battery Tracking**: Real-time battery levels, charging state, wattages, amperage, voltage, and accurate cycle counts for both your Mac and connected iPhones/iPads.
