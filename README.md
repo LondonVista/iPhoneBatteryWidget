@@ -7,6 +7,7 @@ A lightweight, translucent floating macOS desktop widget and comprehensive batte
 [![GitHub Latest Release Downloads](https://img.shields.io/github/downloads/LondonVista/iPhoneBatteryWidget/latest/total?color=94851c&label=latest%20release)](https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest)
 [![macOS 13+](https://img.shields.io/badge/macOS-13.0%2B-blue)](https://github.com/LondonVista/iPhoneBatteryWidget)
 [![Website](https://img.shields.io/badge/Website-Grok%20App-purple)](https://timber-gem-fjord-cobalt.grok.me)
+[![Ko-Fi](https://img.shields.io/badge/Support-Ko--fi-ff5e5b?logo=kofi&logoColor=white)](https://ko-fi.com/london_vista)
 
 <p align="center">
   <img src="assets/dashboard-archive-preview.png" alt="iPhone Battery Widget Dashboard & Battery Degradation Archive" width="100%">
@@ -68,6 +69,16 @@ To have the widget automatically start on login:
 cp com.londonvista.iphone-battery-widget.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.londonvista.iphone-battery-widget.plist
 ```
+
+---
+
+## ☕ Support
+
+If you find iPhone Battery Widget useful, you can support development on Ko-fi:
+
+[![Buy Me a Coffee](https://storage.ko-fi.com/cdn/kofi3.png?v=3)](https://ko-fi.com/london_vista)
+
+👉 **[ko-fi.com/london_vista](https://ko-fi.com/london_vista)**
 
 ---
 
