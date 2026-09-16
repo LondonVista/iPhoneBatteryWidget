@@ -4540,7 +4540,7 @@ struct BatteryHistoryChartView: View {
                 }
             }
         }
-        .frame(width: 880, height: 530)
+        .frame(width: 900, height: 640)
         .background(
             ZStack {
                 // Glassmorphism deep background
@@ -6981,8 +6981,8 @@ final class FloatingPanel: NSPanel {
         let screen = p.screen ?? NSScreen.main ?? NSScreen.screens.first
         let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
         
-        let historyW: CGFloat = 860
-        let historyH: CGFloat = min(560, max(420, vis.height - 24))
+        let historyW: CGFloat = 900
+        let historyH: CGFloat = min(640, max(460, vis.height - 24))
         let historySize = NSSize(width: historyW, height: historyH)
         
         let historyView = BatteryHistoryChartView(
