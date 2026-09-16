@@ -1796,7 +1796,7 @@ final class BatteryWidgetViewModel: ObservableObject {
             UserDefaults.standard.set(eightyPercentAlertEnabled, forKey: "ibw.eightyPercentAlertEnabled")
         }
     }
-    @Published var eightyPercentSoundTheme: String = "crystal" {
+    @Published var eightyPercentSoundTheme: String = "glass" {
         didSet {
             UserDefaults.standard.set(eightyPercentSoundTheme, forKey: "ibw.sound.eightyPercent")
         }
@@ -1804,6 +1804,16 @@ final class BatteryWidgetViewModel: ObservableObject {
     @Published var iphoneConnectSoundTheme: String = "pop" {
         didSet {
             UserDefaults.standard.set(iphoneConnectSoundTheme, forKey: "ibw.sound.iphoneConnect")
+        }
+    }
+    @Published var iphoneDisconnectSoundEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(iphoneDisconnectSoundEnabled, forKey: "ibw.iphoneDisconnectSoundEnabled")
+        }
+    }
+    @Published var iphoneDisconnectSoundTheme: String = "blow" {
+        didSet {
+            UserDefaults.standard.set(iphoneDisconnectSoundTheme, forKey: "ibw.sound.iphoneDisconnect")
         }
     }
     @Published var pdSoundTheme: String = "blow" {
@@ -1830,6 +1840,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var pdHintSound: NSSound?
     private var lastIPhoneConnected: Bool? = nil
     private var lastIPhoneSoundAt: Date = .distantPast
+    private var lastIPhoneDisconnectSoundAt: Date = .distantPast
     private var alerted80DeviceIds: Set<String> = []
     private var last80DingAt: Date = .distantPast
     private var activeChimePlayer1: AVAudioPlayer?
@@ -1966,11 +1977,19 @@ final class BatteryWidgetViewModel: ObservableObject {
         } else {
             eightyPercentAlertEnabled = true
         }
+        if UserDefaults.standard.object(forKey: "ibw.iphoneDisconnectSoundEnabled") != nil {
+            iphoneDisconnectSoundEnabled = UserDefaults.standard.bool(forKey: "ibw.iphoneDisconnectSoundEnabled")
+        } else {
+            iphoneDisconnectSoundEnabled = true
+        }
         if let s = UserDefaults.standard.string(forKey: "ibw.sound.eightyPercent") {
             eightyPercentSoundTheme = s
         }
         if let s = UserDefaults.standard.string(forKey: "ibw.sound.iphoneConnect") {
             iphoneConnectSoundTheme = s
+        }
+        if let s = UserDefaults.standard.string(forKey: "ibw.sound.iphoneDisconnect") {
+            iphoneDisconnectSoundTheme = s
         }
         if let s = UserDefaults.standard.string(forKey: "ibw.sound.pdDisconnect") {
             pdSoundTheme = s
@@ -2481,22 +2500,18 @@ final class BatteryWidgetViewModel: ObservableObject {
         if soundName == nil && Date().timeIntervalSince(lastPDAlertAt) < 2.0 { return }
         if soundName == nil { lastPDAlertAt = Date() }
         let theme = soundName ?? pdSoundTheme
-        let resolved = (theme.lowercased() == "blow") ? "Blow" :
-                       (theme.lowercased() == "bottle") ? "Bottle" :
-                       (theme.lowercased() == "basso") ? "Basso" :
-                       (theme.lowercased() == "sosumi") ? "Sosumi" : "Blow"
+        let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
         panPlayer.playLeftToRight(named: resolved, volume: volume)
     }
 
     private func considerIPhoneConnectionSound(connected: Bool) {
-        guard iphoneSoundEnabled else {
-            lastIPhoneConnected = connected
-            return
-        }
         if let previous = lastIPhoneConnected {
-            if !previous && connected {
+            if !previous && connected && iphoneSoundEnabled {
                 // iPhone plugged in / connected via wire
                 playIPhoneSound()
+            } else if previous && !connected && iphoneDisconnectSoundEnabled {
+                // iPhone unplugged / disconnected
+                playIPhoneDisconnectSound()
             }
         }
         lastIPhoneConnected = connected
@@ -2506,12 +2521,18 @@ final class BatteryWidgetViewModel: ObservableObject {
         if soundName == nil && Date().timeIntervalSince(lastIPhoneSoundAt) < 2.0 { return }
         if soundName == nil { lastIPhoneSoundAt = Date() }
         let theme = soundName ?? iphoneConnectSoundTheme
-        let resolved = (theme.lowercased() == "pop") ? "Pop" :
-                       (theme.lowercased() == "tink") ? "Tink" :
-                       (theme.lowercased() == "bottle") ? "Bottle" :
-                       (theme.lowercased() == "glass") ? "Glass" :
-                       (theme.lowercased() == "hero") ? "Hero" : "Pop"
-        let sound = NSSound(named: NSSound.Name(resolved))
+        let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
+        let sound = NSSound(named: NSSound.Name(resolved)) ?? NSSound(named: NSSound.Name("Pop"))
+        sound?.volume = volume
+        sound?.play()
+    }
+
+    func playIPhoneDisconnectSound(named soundName: String? = nil, volume: Float = 0.80) {
+        if soundName == nil && Date().timeIntervalSince(lastIPhoneDisconnectSoundAt) < 2.0 { return }
+        if soundName == nil { lastIPhoneDisconnectSoundAt = Date() }
+        let theme = soundName ?? iphoneDisconnectSoundTheme
+        let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
+        let sound = NSSound(named: NSSound.Name(resolved)) ?? NSSound(named: NSSound.Name("Blow"))
         sound?.volume = volume
         sound?.play()
     }
@@ -2545,54 +2566,10 @@ final class BatteryWidgetViewModel: ObservableObject {
 
     func play80PercentDingSound(theme: String? = nil) {
         let selectedTheme = theme ?? eightyPercentSoundTheme
-        switch selectedTheme.lowercased() {
-        case "crystal":
-            let tinkURL = URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff")
-            let glassURL = URL(fileURLWithPath: "/System/Library/Sounds/Glass.aiff")
-            if let p1 = try? AVAudioPlayer(contentsOf: tinkURL) {
-                p1.volume = 0.55
-                p1.prepareToPlay()
-                p1.play()
-                self.activeChimePlayer1 = p1
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                guard let self = self else { return }
-                if let p2 = try? AVAudioPlayer(contentsOf: glassURL) {
-                    p2.volume = 0.65
-                    p2.prepareToPlay()
-                    p2.play()
-                    self.activeChimePlayer2 = p2
-                } else {
-                    let fallback = NSSound(named: NSSound.Name("Glass"))
-                    fallback?.volume = 0.65
-                    fallback?.play()
-                }
-            }
-        case "glass":
-            let sound = NSSound(named: NSSound.Name("Glass"))
-            sound?.volume = 0.70
-            sound?.play()
-        case "hero":
-            let sound = NSSound(named: NSSound.Name("Hero"))
-            sound?.volume = 0.70
-            sound?.play()
-        case "bottle":
-            let sound = NSSound(named: NSSound.Name("Bottle"))
-            sound?.volume = 0.75
-            sound?.play()
-        case "submarine":
-            let sound = NSSound(named: NSSound.Name("Submarine"))
-            sound?.volume = 0.70
-            sound?.play()
-        case "ping":
-            let sound = NSSound(named: NSSound.Name("Ping"))
-            sound?.volume = 0.75
-            sound?.play()
-        default:
-            let sound = NSSound(named: NSSound.Name("Glass"))
-            sound?.volume = 0.70
-            sound?.play()
-        }
+        let resolved = selectedTheme.prefix(1).uppercased() + selectedTheme.dropFirst().lowercased()
+        let sound = NSSound(named: NSSound.Name(resolved)) ?? NSSound(named: NSSound.Name("Glass"))
+        sound?.volume = 0.80
+        sound?.play()
     }
 
     private func startTimer() {
@@ -5682,7 +5659,7 @@ struct BatteryHistoryChartView: View {
                 Spacer()
             }
 
-            // 1. 80% Charge Limit Ding (iPhone)
+            // 1. 80% Charge Limit Ding (iPhone Only)
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -5703,33 +5680,55 @@ struct BatteryHistoryChartView: View {
                 }
 
                 if vm.eightyPercentAlertEnabled {
-                    HStack(spacing: 5) {
-                        Text("Chime:")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.5))
-                        audioOptionPill(title: "Crystal", id: "crystal", current: vm.eightyPercentSoundTheme) {
-                            vm.eightyPercentSoundTheme = "crystal"
-                            vm.play80PercentDingSound(theme: "crystal")
-                        }
-                        audioOptionPill(title: "Glass", id: "glass", current: vm.eightyPercentSoundTheme) {
-                            vm.eightyPercentSoundTheme = "glass"
-                            vm.play80PercentDingSound(theme: "glass")
-                        }
-                        audioOptionPill(title: "Hero", id: "hero", current: vm.eightyPercentSoundTheme) {
-                            vm.eightyPercentSoundTheme = "hero"
-                            vm.play80PercentDingSound(theme: "hero")
-                        }
-                        audioOptionPill(title: "Bottle", id: "bottle", current: vm.eightyPercentSoundTheme) {
-                            vm.eightyPercentSoundTheme = "bottle"
-                            vm.play80PercentDingSound(theme: "bottle")
-                        }
-                        audioOptionPill(title: "Submarine", id: "submarine", current: vm.eightyPercentSoundTheme) {
-                            vm.eightyPercentSoundTheme = "submarine"
-                            vm.play80PercentDingSound(theme: "submarine")
-                        }
-                        audioOptionPill(title: "Ping", id: "ping", current: vm.eightyPercentSoundTheme) {
-                            vm.eightyPercentSoundTheme = "ping"
-                            vm.play80PercentDingSound(theme: "ping")
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            Text("Chime:")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.5))
+                            audioOptionPill(title: "Glass", id: "glass", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "glass"
+                                vm.play80PercentDingSound(theme: "glass")
+                            }
+                            audioOptionPill(title: "Hero", id: "hero", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "hero"
+                                vm.play80PercentDingSound(theme: "hero")
+                            }
+                            audioOptionPill(title: "Tink", id: "tink", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "tink"
+                                vm.play80PercentDingSound(theme: "tink")
+                            }
+                            audioOptionPill(title: "Bottle", id: "bottle", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "bottle"
+                                vm.play80PercentDingSound(theme: "bottle")
+                            }
+                            audioOptionPill(title: "Pop", id: "pop", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "pop"
+                                vm.play80PercentDingSound(theme: "pop")
+                            }
+                            audioOptionPill(title: "Submarine", id: "submarine", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "submarine"
+                                vm.play80PercentDingSound(theme: "submarine")
+                            }
+                            audioOptionPill(title: "Purr", id: "purr", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "purr"
+                                vm.play80PercentDingSound(theme: "purr")
+                            }
+                            audioOptionPill(title: "Funk", id: "funk", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "funk"
+                                vm.play80PercentDingSound(theme: "funk")
+                            }
+                            audioOptionPill(title: "Sosumi", id: "sosumi", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "sosumi"
+                                vm.play80PercentDingSound(theme: "sosumi")
+                            }
+                            audioOptionPill(title: "Ping", id: "ping", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "ping"
+                                vm.play80PercentDingSound(theme: "ping")
+                            }
+                            audioOptionPill(title: "Basso", id: "basso", current: vm.eightyPercentSoundTheme) {
+                                vm.eightyPercentSoundTheme = "basso"
+                                vm.play80PercentDingSound(theme: "basso")
+                            }
                         }
                     }
                     .padding(.top, 2)
@@ -5738,11 +5737,11 @@ struct BatteryHistoryChartView: View {
 
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
 
-            // 2. iPhone Connection Sound
+            // 2. iPhone Connected Sound
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("iPhone Connection Sound")
+                        Text("iPhone Connected Sound")
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundColor(.white.opacity(0.9))
                         Text("Plays when iPhone is plugged in via USB-C or Lightning cable")
@@ -5759,29 +5758,47 @@ struct BatteryHistoryChartView: View {
                 }
 
                 if vm.iphoneSoundEnabled {
-                    HStack(spacing: 5) {
-                        Text("Sound:")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.5))
-                        audioOptionPill(title: "Pop", id: "pop", current: vm.iphoneConnectSoundTheme) {
-                            vm.iphoneConnectSoundTheme = "pop"
-                            vm.playIPhoneSound(named: "Pop")
-                        }
-                        audioOptionPill(title: "Tink", id: "tink", current: vm.iphoneConnectSoundTheme) {
-                            vm.iphoneConnectSoundTheme = "tink"
-                            vm.playIPhoneSound(named: "Tink")
-                        }
-                        audioOptionPill(title: "Bottle", id: "bottle", current: vm.iphoneConnectSoundTheme) {
-                            vm.iphoneConnectSoundTheme = "bottle"
-                            vm.playIPhoneSound(named: "Bottle")
-                        }
-                        audioOptionPill(title: "Glass", id: "glass", current: vm.iphoneConnectSoundTheme) {
-                            vm.iphoneConnectSoundTheme = "glass"
-                            vm.playIPhoneSound(named: "Glass")
-                        }
-                        audioOptionPill(title: "Hero", id: "hero", current: vm.iphoneConnectSoundTheme) {
-                            vm.iphoneConnectSoundTheme = "hero"
-                            vm.playIPhoneSound(named: "Hero")
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            Text("Sound:")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.5))
+                            audioOptionPill(title: "Pop", id: "pop", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "pop"
+                                vm.playIPhoneSound(named: "Pop")
+                            }
+                            audioOptionPill(title: "Tink", id: "tink", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "tink"
+                                vm.playIPhoneSound(named: "Tink")
+                            }
+                            audioOptionPill(title: "Bottle", id: "bottle", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "bottle"
+                                vm.playIPhoneSound(named: "Bottle")
+                            }
+                            audioOptionPill(title: "Glass", id: "glass", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "glass"
+                                vm.playIPhoneSound(named: "Glass")
+                            }
+                            audioOptionPill(title: "Hero", id: "hero", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "hero"
+                                vm.playIPhoneSound(named: "Hero")
+                            }
+                            audioOptionPill(title: "Funk", id: "funk", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "funk"
+                                vm.playIPhoneSound(named: "Funk")
+                            }
+                            audioOptionPill(title: "Morse", id: "morse", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "morse"
+                                vm.playIPhoneSound(named: "Morse")
+                            }
+                            audioOptionPill(title: "Purr", id: "purr", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "purr"
+                                vm.playIPhoneSound(named: "Purr")
+                            }
+                            audioOptionPill(title: "Ping", id: "ping", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "ping"
+                                vm.playIPhoneSound(named: "Ping")
+                            }
                         }
                     }
                     .padding(.top, 2)
@@ -5790,7 +5807,77 @@ struct BatteryHistoryChartView: View {
 
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
 
-            // 3. USB-PD Disconnect Chime
+            // 3. iPhone Disconnected Sound
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("iPhone Disconnected Sound")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Plays when iPhone is unplugged or disconnected from cable")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    testAudioButton {
+                        vm.playIPhoneDisconnectSound()
+                    }
+                    Toggle("", isOn: $vm.iphoneDisconnectSoundEnabled)
+                        .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
+                        .labelsHidden()
+                }
+
+                if vm.iphoneDisconnectSoundEnabled {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            Text("Sound:")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.5))
+                            audioOptionPill(title: "Blow", id: "blow", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "blow"
+                                vm.playIPhoneDisconnectSound(named: "Blow")
+                            }
+                            audioOptionPill(title: "Bottle", id: "bottle", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "bottle"
+                                vm.playIPhoneDisconnectSound(named: "Bottle")
+                            }
+                            audioOptionPill(title: "Basso", id: "basso", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "basso"
+                                vm.playIPhoneDisconnectSound(named: "Basso")
+                            }
+                            audioOptionPill(title: "Pop", id: "pop", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "pop"
+                                vm.playIPhoneDisconnectSound(named: "Pop")
+                            }
+                            audioOptionPill(title: "Tink", id: "tink", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "tink"
+                                vm.playIPhoneDisconnectSound(named: "Tink")
+                            }
+                            audioOptionPill(title: "Sosumi", id: "sosumi", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "sosumi"
+                                vm.playIPhoneDisconnectSound(named: "Sosumi")
+                            }
+                            audioOptionPill(title: "Purr", id: "purr", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "purr"
+                                vm.playIPhoneDisconnectSound(named: "Purr")
+                            }
+                            audioOptionPill(title: "Frog", id: "frog", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "frog"
+                                vm.playIPhoneDisconnectSound(named: "Frog")
+                            }
+                            audioOptionPill(title: "Submarine", id: "submarine", current: vm.iphoneDisconnectSoundTheme) {
+                                vm.iphoneDisconnectSoundTheme = "submarine"
+                                vm.playIPhoneDisconnectSound(named: "Submarine")
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                }
+            }
+
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+
+            // 4. USB-PD Disconnect Chime
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -5811,25 +5898,43 @@ struct BatteryHistoryChartView: View {
                 }
 
                 if vm.pdSoundEnabled {
-                    HStack(spacing: 5) {
-                        Text("Tone:")
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.5))
-                        audioOptionPill(title: "Blow (Sweep)", id: "blow", current: vm.pdSoundTheme) {
-                            vm.pdSoundTheme = "blow"
-                            vm.playPDSound(named: "Blow")
-                        }
-                        audioOptionPill(title: "Bottle", id: "bottle", current: vm.pdSoundTheme) {
-                            vm.pdSoundTheme = "bottle"
-                            vm.playPDSound(named: "Bottle")
-                        }
-                        audioOptionPill(title: "Basso", id: "basso", current: vm.pdSoundTheme) {
-                            vm.pdSoundTheme = "basso"
-                            vm.playPDSound(named: "Basso")
-                        }
-                        audioOptionPill(title: "Sosumi", id: "sosumi", current: vm.pdSoundTheme) {
-                            vm.pdSoundTheme = "sosumi"
-                            vm.playPDSound(named: "Sosumi")
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            Text("Tone:")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.5))
+                            audioOptionPill(title: "Blow (Sweep)", id: "blow", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "blow"
+                                vm.playPDSound(named: "Blow")
+                            }
+                            audioOptionPill(title: "Bottle", id: "bottle", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "bottle"
+                                vm.playPDSound(named: "Bottle")
+                            }
+                            audioOptionPill(title: "Basso", id: "basso", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "basso"
+                                vm.playPDSound(named: "Basso")
+                            }
+                            audioOptionPill(title: "Sosumi", id: "sosumi", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "sosumi"
+                                vm.playPDSound(named: "Sosumi")
+                            }
+                            audioOptionPill(title: "Submarine", id: "submarine", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "submarine"
+                                vm.playPDSound(named: "Submarine")
+                            }
+                            audioOptionPill(title: "Frog", id: "frog", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "frog"
+                                vm.playPDSound(named: "Frog")
+                            }
+                            audioOptionPill(title: "Funk", id: "funk", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "funk"
+                                vm.playPDSound(named: "Funk")
+                            }
+                            audioOptionPill(title: "Glass", id: "glass", current: vm.pdSoundTheme) {
+                                vm.pdSoundTheme = "glass"
+                                vm.playPDSound(named: "Glass")
+                            }
                         }
                     }
                     .padding(.top, 2)
