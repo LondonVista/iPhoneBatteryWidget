@@ -1796,6 +1796,21 @@ final class BatteryWidgetViewModel: ObservableObject {
             UserDefaults.standard.set(eightyPercentAlertEnabled, forKey: "ibw.eightyPercentAlertEnabled")
         }
     }
+    @Published var eightyPercentSoundTheme: String = "crystal" {
+        didSet {
+            UserDefaults.standard.set(eightyPercentSoundTheme, forKey: "ibw.sound.eightyPercent")
+        }
+    }
+    @Published var iphoneConnectSoundTheme: String = "pop" {
+        didSet {
+            UserDefaults.standard.set(iphoneConnectSoundTheme, forKey: "ibw.sound.iphoneConnect")
+        }
+    }
+    @Published var pdSoundTheme: String = "blow" {
+        didSet {
+            UserDefaults.standard.set(pdSoundTheme, forKey: "ibw.sound.pdDisconnect")
+        }
+    }
     @Published var firstLidOpenToday: Date? = nil
     @Published var todayLidSessions: [LidSession] = []
 
@@ -1950,6 +1965,15 @@ final class BatteryWidgetViewModel: ObservableObject {
             eightyPercentAlertEnabled = UserDefaults.standard.bool(forKey: "ibw.eightyPercentAlertEnabled")
         } else {
             eightyPercentAlertEnabled = true
+        }
+        if let s = UserDefaults.standard.string(forKey: "ibw.sound.eightyPercent") {
+            eightyPercentSoundTheme = s
+        }
+        if let s = UserDefaults.standard.string(forKey: "ibw.sound.iphoneConnect") {
+            iphoneConnectSoundTheme = s
+        }
+        if let s = UserDefaults.standard.string(forKey: "ibw.sound.pdDisconnect") {
+            pdSoundTheme = s
         }
     }
 
@@ -2444,7 +2468,7 @@ final class BatteryWidgetViewModel: ObservableObject {
 
         if let pending = pdDisconnectPending, !currentPD {
             if Date().timeIntervalSince(pending) >= pdDebounceInterval {
-                playPDSound(named: "Blow", volume: 0.80)
+                playPDSound()
                 pdDisconnectPending = nil
                 lastPDHandshakeOn = false
             }
@@ -2453,10 +2477,15 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
-    private func playPDSound(named soundName: String, volume: Float) {
-        if Date().timeIntervalSince(lastPDAlertAt) < 3.0 { return }
-        lastPDAlertAt = Date()
-        panPlayer.playLeftToRight(named: soundName, volume: volume)
+    func playPDSound(named soundName: String? = nil, volume: Float = 0.80) {
+        if soundName == nil && Date().timeIntervalSince(lastPDAlertAt) < 2.0 { return }
+        if soundName == nil { lastPDAlertAt = Date() }
+        let theme = soundName ?? pdSoundTheme
+        let resolved = (theme.lowercased() == "blow") ? "Blow" :
+                       (theme.lowercased() == "bottle") ? "Bottle" :
+                       (theme.lowercased() == "basso") ? "Basso" :
+                       (theme.lowercased() == "sosumi") ? "Sosumi" : "Blow"
+        panPlayer.playLeftToRight(named: resolved, volume: volume)
     }
 
     private func considerIPhoneConnectionSound(connected: Bool) {
@@ -2467,16 +2496,22 @@ final class BatteryWidgetViewModel: ObservableObject {
         if let previous = lastIPhoneConnected {
             if !previous && connected {
                 // iPhone plugged in / connected via wire
-                playIPhoneSound(named: "Pop", volume: 0.85)
+                playIPhoneSound()
             }
         }
         lastIPhoneConnected = connected
     }
 
-    private func playIPhoneSound(named soundName: String, volume: Float) {
-        if Date().timeIntervalSince(lastIPhoneSoundAt) < 3.0 { return }
-        lastIPhoneSoundAt = Date()
-        let sound = NSSound(named: NSSound.Name(soundName))
+    func playIPhoneSound(named soundName: String? = nil, volume: Float = 0.85) {
+        if soundName == nil && Date().timeIntervalSince(lastIPhoneSoundAt) < 2.0 { return }
+        if soundName == nil { lastIPhoneSoundAt = Date() }
+        let theme = soundName ?? iphoneConnectSoundTheme
+        let resolved = (theme.lowercased() == "pop") ? "Pop" :
+                       (theme.lowercased() == "tink") ? "Tink" :
+                       (theme.lowercased() == "bottle") ? "Bottle" :
+                       (theme.lowercased() == "glass") ? "Glass" :
+                       (theme.lowercased() == "hero") ? "Hero" : "Pop"
+        let sound = NSSound(named: NSSound.Name(resolved))
         sound?.volume = volume
         sound?.play()
     }
@@ -2492,7 +2527,10 @@ final class BatteryWidgetViewModel: ObservableObject {
                 if dev.capacityExact >= 80.0 {
                     if !alerted80DeviceIds.contains(dev.deviceId) {
                         alerted80DeviceIds.insert(dev.deviceId)
-                        play80PercentDingSound()
+                        if Date().timeIntervalSince(last80DingAt) >= 5.0 {
+                            last80DingAt = Date()
+                            play80PercentDingSound()
+                        }
                     }
                 } else if dev.capacityExact < 78.0 {
                     alerted80DeviceIds.remove(dev.deviceId)
@@ -2505,33 +2543,55 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
-    private func play80PercentDingSound() {
-        if Date().timeIntervalSince(last80DingAt) < 5.0 { return }
-        last80DingAt = Date()
-        
-        // Gentle, soothing dual-tone chime (soft tink followed by crystal glass resonance)
-        let tinkURL = URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff")
-        let glassURL = URL(fileURLWithPath: "/System/Library/Sounds/Glass.aiff")
-        
-        if let p1 = try? AVAudioPlayer(contentsOf: tinkURL) {
-            p1.volume = 0.55
-            p1.prepareToPlay()
-            p1.play()
-            self.activeChimePlayer1 = p1
-        }
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            guard let self = self else { return }
-            if let p2 = try? AVAudioPlayer(contentsOf: glassURL) {
-                p2.volume = 0.65
-                p2.prepareToPlay()
-                p2.play()
-                self.activeChimePlayer2 = p2
-            } else {
-                let fallback = NSSound(named: NSSound.Name("Glass"))
-                fallback?.volume = 0.65
-                fallback?.play()
+    func play80PercentDingSound(theme: String? = nil) {
+        let selectedTheme = theme ?? eightyPercentSoundTheme
+        switch selectedTheme.lowercased() {
+        case "crystal":
+            let tinkURL = URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff")
+            let glassURL = URL(fileURLWithPath: "/System/Library/Sounds/Glass.aiff")
+            if let p1 = try? AVAudioPlayer(contentsOf: tinkURL) {
+                p1.volume = 0.55
+                p1.prepareToPlay()
+                p1.play()
+                self.activeChimePlayer1 = p1
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self = self else { return }
+                if let p2 = try? AVAudioPlayer(contentsOf: glassURL) {
+                    p2.volume = 0.65
+                    p2.prepareToPlay()
+                    p2.play()
+                    self.activeChimePlayer2 = p2
+                } else {
+                    let fallback = NSSound(named: NSSound.Name("Glass"))
+                    fallback?.volume = 0.65
+                    fallback?.play()
+                }
+            }
+        case "glass":
+            let sound = NSSound(named: NSSound.Name("Glass"))
+            sound?.volume = 0.70
+            sound?.play()
+        case "hero":
+            let sound = NSSound(named: NSSound.Name("Hero"))
+            sound?.volume = 0.70
+            sound?.play()
+        case "bottle":
+            let sound = NSSound(named: NSSound.Name("Bottle"))
+            sound?.volume = 0.75
+            sound?.play()
+        case "submarine":
+            let sound = NSSound(named: NSSound.Name("Submarine"))
+            sound?.volume = 0.70
+            sound?.play()
+        case "ping":
+            let sound = NSSound(named: NSSound.Name("Ping"))
+            sound?.volume = 0.75
+            sound?.play()
+        default:
+            let sound = NSSound(named: NSSound.Name("Glass"))
+            sound?.volume = 0.70
+            sound?.play()
         }
     }
 
@@ -5611,7 +5671,7 @@ struct BatteryHistoryChartView: View {
     }
 
     private var settingsAudioCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Image(systemName: "speaker.wave.2.fill")
                     .font(.system(size: 13, weight: .bold))
@@ -5622,59 +5682,203 @@ struct BatteryHistoryChartView: View {
                 Spacer()
             }
 
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("USB-PD Disconnect Chime")
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.9))
-                    Text("Play an audible tone when USB-PD charger is unplugged / disconnected")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.5))
+            // 1. 80% Charge Limit Ding (iPhone)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("80% Charge Limit Ding")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Plays exclusively when connected iPhone or iPad reaches 80% charge")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    testAudioButton {
+                        vm.play80PercentDingSound()
+                    }
+                    Toggle("", isOn: $vm.eightyPercentAlertEnabled)
+                        .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
+                        .labelsHidden()
                 }
-                Spacer()
-                Toggle("", isOn: $vm.pdSoundEnabled)
-                    .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
-                    .labelsHidden()
+
+                if vm.eightyPercentAlertEnabled {
+                    HStack(spacing: 5) {
+                        Text("Chime:")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.5))
+                        audioOptionPill(title: "Crystal", id: "crystal", current: vm.eightyPercentSoundTheme) {
+                            vm.eightyPercentSoundTheme = "crystal"
+                            vm.play80PercentDingSound(theme: "crystal")
+                        }
+                        audioOptionPill(title: "Glass", id: "glass", current: vm.eightyPercentSoundTheme) {
+                            vm.eightyPercentSoundTheme = "glass"
+                            vm.play80PercentDingSound(theme: "glass")
+                        }
+                        audioOptionPill(title: "Hero", id: "hero", current: vm.eightyPercentSoundTheme) {
+                            vm.eightyPercentSoundTheme = "hero"
+                            vm.play80PercentDingSound(theme: "hero")
+                        }
+                        audioOptionPill(title: "Bottle", id: "bottle", current: vm.eightyPercentSoundTheme) {
+                            vm.eightyPercentSoundTheme = "bottle"
+                            vm.play80PercentDingSound(theme: "bottle")
+                        }
+                        audioOptionPill(title: "Submarine", id: "submarine", current: vm.eightyPercentSoundTheme) {
+                            vm.eightyPercentSoundTheme = "submarine"
+                            vm.play80PercentDingSound(theme: "submarine")
+                        }
+                        audioOptionPill(title: "Ping", id: "ping", current: vm.eightyPercentSoundTheme) {
+                            vm.eightyPercentSoundTheme = "ping"
+                            vm.play80PercentDingSound(theme: "ping")
+                        }
+                    }
+                    .padding(.top, 2)
+                }
             }
 
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
 
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("iPhone Connection Sound")
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.9))
-                    Text("Play a subtle audio chime when iPhone is connected via cable")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.5))
+            // 2. iPhone Connection Sound
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("iPhone Connection Sound")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Plays when iPhone is plugged in via USB-C or Lightning cable")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    testAudioButton {
+                        vm.playIPhoneSound()
+                    }
+                    Toggle("", isOn: $vm.iphoneSoundEnabled)
+                        .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
+                        .labelsHidden()
                 }
-                Spacer()
-                Toggle("", isOn: $vm.iphoneSoundEnabled)
-                    .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
-                    .labelsHidden()
+
+                if vm.iphoneSoundEnabled {
+                    HStack(spacing: 5) {
+                        Text("Sound:")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.5))
+                        audioOptionPill(title: "Pop", id: "pop", current: vm.iphoneConnectSoundTheme) {
+                            vm.iphoneConnectSoundTheme = "pop"
+                            vm.playIPhoneSound(named: "Pop")
+                        }
+                        audioOptionPill(title: "Tink", id: "tink", current: vm.iphoneConnectSoundTheme) {
+                            vm.iphoneConnectSoundTheme = "tink"
+                            vm.playIPhoneSound(named: "Tink")
+                        }
+                        audioOptionPill(title: "Bottle", id: "bottle", current: vm.iphoneConnectSoundTheme) {
+                            vm.iphoneConnectSoundTheme = "bottle"
+                            vm.playIPhoneSound(named: "Bottle")
+                        }
+                        audioOptionPill(title: "Glass", id: "glass", current: vm.iphoneConnectSoundTheme) {
+                            vm.iphoneConnectSoundTheme = "glass"
+                            vm.playIPhoneSound(named: "Glass")
+                        }
+                        audioOptionPill(title: "Hero", id: "hero", current: vm.iphoneConnectSoundTheme) {
+                            vm.iphoneConnectSoundTheme = "hero"
+                            vm.playIPhoneSound(named: "Hero")
+                        }
+                    }
+                    .padding(.top, 2)
+                }
             }
 
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
 
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("80% Charge Limit Ding")
-                        .font(.system(size: 11.5, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.9))
-                    Text("Play a gentle crystal chime when iPhone reaches 80% charge")
-                        .font(.system(size: 10))
-                        .foregroundColor(.white.opacity(0.5))
+            // 3. USB-PD Disconnect Chime
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("USB-PD Disconnect Chime")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Stereo left-to-right panning audio when high-speed charger unplugged")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    testAudioButton {
+                        vm.playPDSound()
+                    }
+                    Toggle("", isOn: $vm.pdSoundEnabled)
+                        .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
+                        .labelsHidden()
                 }
-                Spacer()
-                Toggle("", isOn: $vm.eightyPercentAlertEnabled)
-                    .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
-                    .labelsHidden()
+
+                if vm.pdSoundEnabled {
+                    HStack(spacing: 5) {
+                        Text("Tone:")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.5))
+                        audioOptionPill(title: "Blow (Sweep)", id: "blow", current: vm.pdSoundTheme) {
+                            vm.pdSoundTheme = "blow"
+                            vm.playPDSound(named: "Blow")
+                        }
+                        audioOptionPill(title: "Bottle", id: "bottle", current: vm.pdSoundTheme) {
+                            vm.pdSoundTheme = "bottle"
+                            vm.playPDSound(named: "Bottle")
+                        }
+                        audioOptionPill(title: "Basso", id: "basso", current: vm.pdSoundTheme) {
+                            vm.pdSoundTheme = "basso"
+                            vm.playPDSound(named: "Basso")
+                        }
+                        audioOptionPill(title: "Sosumi", id: "sosumi", current: vm.pdSoundTheme) {
+                            vm.pdSoundTheme = "sosumi"
+                            vm.playPDSound(named: "Sosumi")
+                        }
+                    }
+                    .padding(.top, 2)
+                }
             }
         }
         .padding(14)
         .background(Color.white.opacity(0.04))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
+    }
+
+    private func audioOptionPill(title: String, id: String, current: String, onSelect: @escaping () -> Void) -> some View {
+        let isSelected = current.lowercased() == id.lowercased()
+        return Button(action: onSelect) {
+            HStack(spacing: 3) {
+                if isSelected {
+                    Image(systemName: "speaker.wave.1.fill")
+                        .font(.system(size: 8))
+                }
+                Text(title)
+                    .font(.system(size: 9.5, weight: isSelected ? .bold : .medium))
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3.5)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isSelected ? Color(hex: "#30D158").opacity(0.3) : Color.white.opacity(0.06))
+            )
+            .foregroundColor(isSelected ? Color.white : Color.white.opacity(0.7))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func testAudioButton(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 7.5))
+                Text("Test")
+                    .font(.system(size: 9.5, weight: .semibold))
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3.5)
+            .background(Color.white.opacity(0.10))
+            .foregroundColor(Color(hex: "#30D158"))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
     }
 
     private var settingsDatabaseCard: some View {
