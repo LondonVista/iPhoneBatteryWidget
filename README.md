@@ -2,10 +2,11 @@
 
 A lightweight, translucent floating macOS desktop widget and comprehensive battery dashboard for MacBooks, iPhones, and iPads.
 
-![macOS 13+](https://img.shields.io/badge/macOS-13.0%2B-blue)
-![Swift 5.9+](https://img.shields.io/badge/Swift-5.9%2B-orange)
-![License](https://img.shields.io/badge/license-MIT-green)
-[![Website](https://img.shields.io/badge/Website-Live%20Page-emerald)](https://londonvista.github.io/iPhoneBatteryWidget/)
+[![GitHub Downloads](https://img.shields.io/github/downloads/LondonVista/iPhoneBatteryWidget/total?color=5b9e38&label=downloads)](https://github.com/LondonVista/iPhoneBatteryWidget/releases)
+[![GitHub Release](https://img.shields.io/github/v/release/LondonVista/iPhoneBatteryWidget?color=007ec6&label=release)](https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest)
+[![GitHub Latest Release Downloads](https://img.shields.io/github/downloads/LondonVista/iPhoneBatteryWidget/latest/total?color=94851c&label=latest%20release)](https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest)
+[![macOS 13+](https://img.shields.io/badge/macOS-13.0%2B-blue)](https://github.com/LondonVista/iPhoneBatteryWidget)
+[![Website](https://img.shields.io/badge/Website-Grok%20App-purple)](https://timber-gem-fjord-cobalt.grok.me)
 
 <p align="center">
   <img src="assets/dashboard-archive-preview.png" alt="iPhone Battery Widget Dashboard & Battery Degradation Archive" width="100%">
