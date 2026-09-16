@@ -3749,9 +3749,26 @@ struct ModernDataTableRowView: View {
     }
 
     private var modelText: String {
-        if let m = pt.deviceModel { return m }
-        if pt.deviceId == "local_mac" || pt.deviceType == .mac { return "MacBookAir10,1" }
-        return activeDeviceModel ?? "iPhone 17 Pro"
+        if let m = pt.deviceModel, !m.isEmpty {
+            let lower = m.lowercased()
+            if lower.contains("18,1") || lower.contains("17") || (lower.contains("iphone") && !lower.contains("15") && !lower.contains("mac")) {
+                return "iPhone18,1"
+            }
+            if lower.contains("mac") || lower.contains("macbookair10") {
+                return "MacBookAir10,1"
+            }
+            if lower.contains("15") {
+                return "iPhone15,4"
+            }
+            return m
+        }
+        if pt.deviceId == "local_mac" || pt.deviceType == .mac || (pt.deviceName?.lowercased().contains("mac") ?? false) {
+            return "MacBookAir10,1"
+        }
+        if pt.deviceId.contains("26cc71869") || (pt.deviceName?.contains("15") ?? false) {
+            return "iPhone15,4"
+        }
+        return "iPhone18,1"
     }
 
     private var nameText: String {
