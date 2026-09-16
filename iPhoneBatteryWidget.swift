@@ -1817,6 +1817,8 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var lastIPhoneSoundAt: Date = .distantPast
     private var alerted80DeviceIds: Set<String> = []
     private var last80DingAt: Date = .distantPast
+    private var activeChimePlayer1: AVAudioPlayer?
+    private var activeChimePlayer2: AVAudioPlayer?
     private var panPlayer = PanAudioPlayer()
 
     var selectedDevice: DeviceBatteryData? {
@@ -2482,6 +2484,9 @@ final class BatteryWidgetViewModel: ObservableObject {
     private func consider80PercentChargeDing(devices: [DeviceBatteryData]) {
         guard eightyPercentAlertEnabled else { return }
         for dev in devices {
+            // ONLY play 80% sound for iPhone / iPad, NEVER for Mac
+            guard dev.deviceType != .mac && dev.deviceId != "local_mac" else { continue }
+            
             let isChargingOrAC = dev.isCharging || (dev.isACConnected == true)
             if isChargingOrAC {
                 if dev.capacityExact >= 80.0 {
@@ -2503,9 +2508,31 @@ final class BatteryWidgetViewModel: ObservableObject {
     private func play80PercentDingSound() {
         if Date().timeIntervalSince(last80DingAt) < 5.0 { return }
         last80DingAt = Date()
-        let sound = NSSound(named: NSSound.Name("Ping")) ?? NSSound(named: NSSound.Name("Glass"))
-        sound?.volume = 0.90
-        sound?.play()
+        
+        // Gentle, soothing dual-tone chime (soft tink followed by crystal glass resonance)
+        let tinkURL = URL(fileURLWithPath: "/System/Library/Sounds/Tink.aiff")
+        let glassURL = URL(fileURLWithPath: "/System/Library/Sounds/Glass.aiff")
+        
+        if let p1 = try? AVAudioPlayer(contentsOf: tinkURL) {
+            p1.volume = 0.55
+            p1.prepareToPlay()
+            p1.play()
+            self.activeChimePlayer1 = p1
+        }
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self = self else { return }
+            if let p2 = try? AVAudioPlayer(contentsOf: glassURL) {
+                p2.volume = 0.65
+                p2.prepareToPlay()
+                p2.play()
+                self.activeChimePlayer2 = p2
+            } else {
+                let fallback = NSSound(named: NSSound.Name("Glass"))
+                fallback?.volume = 0.65
+                fallback?.play()
+            }
+        }
     }
 
     private func startTimer() {
@@ -5634,7 +5661,7 @@ struct BatteryHistoryChartView: View {
                     Text("80% Charge Limit Ding")
                         .font(.system(size: 11.5, weight: .semibold))
                         .foregroundColor(.white.opacity(0.9))
-                    Text("Play a clear ding chime when iPhone or Mac reaches 80% charge")
+                    Text("Play a gentle crystal chime when iPhone reaches 80% charge")
                         .font(.system(size: 10))
                         .foregroundColor(.white.opacity(0.5))
                 }
