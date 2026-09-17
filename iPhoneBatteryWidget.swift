@@ -4,11 +4,12 @@ import AVFoundation
 import IOKit.ps
 import CryptoKit
 import Compression
+import Combine
 
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.3"
+    static let appVersion = "1.0.4"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -2092,6 +2093,25 @@ final class BatteryWidgetViewModel: ObservableObject {
             UserDefaults.standard.set(backgroundOpacity, forKey: "batteryWidget.bgOpacity")
         }
     }
+    @Published var widgetScale: Double = 1.0 {
+        didSet {
+            UserDefaults.standard.set(widgetScale, forKey: "ibw.widgetScale")
+        }
+    }
+
+    func zoomIn() {
+        let next = min(1.50, ((widgetScale + 0.05) * 100).rounded() / 100)
+        widgetScale = next
+    }
+
+    func zoomOut() {
+        let next = max(0.70, ((widgetScale - 0.05) * 100).rounded() / 100)
+        widgetScale = next
+    }
+
+    func resetZoom() {
+        widgetScale = 1.0
+    }
     @Published var pdSoundEnabled: Bool = true {
         didSet {
             UserDefaults.standard.set(pdSoundEnabled, forKey: "ibw.pdHandshakeSound")
@@ -2307,6 +2327,12 @@ final class BatteryWidgetViewModel: ObservableObject {
             self.backgroundOpacity = max(0.02, min(0.98, op))
         } else {
             self.backgroundOpacity = 0.48
+        }
+        if UserDefaults.standard.object(forKey: "ibw.widgetScale") != nil {
+            let sc = UserDefaults.standard.double(forKey: "ibw.widgetScale")
+            self.widgetScale = max(0.70, min(1.50, sc))
+        } else {
+            self.widgetScale = 1.0
         }
         if UserDefaults.standard.object(forKey: "ibw.pdHandshakeSound") != nil {
             pdSoundEnabled = UserDefaults.standard.bool(forKey: "ibw.pdHandshakeSound")
@@ -6009,7 +6035,8 @@ struct BatteryHistoryChartView: View {
     }
 
     private var settingsAppearanceCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
+            // Appearance & Transparency Header
             HStack {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 13, weight: .bold))
@@ -6037,7 +6064,7 @@ struct BatteryHistoryChartView: View {
             }
 
             HStack(spacing: 6) {
-                Text("Quick Presets:")
+                Text("Glass Presets:")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white.opacity(0.7))
                 presetButton(name: "Ghost (10%)", val: 0.10)
@@ -6046,11 +6073,153 @@ struct BatteryHistoryChartView: View {
                 presetButton(name: "Dark (75%)", val: 0.75)
                 presetButton(name: "Solid (95%)", val: 0.95)
             }
+
+            Divider()
+                .background(Color.white.opacity(0.08))
+                .padding(.vertical, 2)
+
+            // Scale & Size Section
+            HStack {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundColor(Color(hex: "#FF9F0A"))
+                Text("Widget Sizing & Scale")
+                    .font(.system(size: 12.5, weight: .bold))
+                    .foregroundColor(.white)
+                Spacer()
+                Text("\(Int(round(vm.widgetScale * 100)))%")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(Color(hex: "#FF9F0A"))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color(hex: "#FF9F0A").opacity(0.12))
+                    .clipShape(Capsule())
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Widget Scale (\(Int(round(vm.widgetScale * 100)))%)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.6))
+                    Spacer()
+                    if abs(vm.widgetScale - 1.0) > 0.001 {
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.15)) {
+                                vm.resetZoom()
+                            }
+                        }) {
+                            Text("Reset (100%)")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(Color(hex: "#0A84FF"))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                Slider(value: $vm.widgetScale, in: 0.70...1.50, step: 0.05)
+                    .accentColor(Color(hex: "#FF9F0A"))
+            }
+
+            HStack(spacing: 6) {
+                Text("Size Presets:")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.7))
+                scalePresetButton(name: "85%", val: 0.85)
+                scalePresetButton(name: "100%", val: 1.00)
+                scalePresetButton(name: "115%", val: 1.15)
+                scalePresetButton(name: "130%", val: 1.30)
+                scalePresetButton(name: "150%", val: 1.50)
+            }
+
+            // Keyboard Shortcuts Guide Card
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 5) {
+                    Image(systemName: "command")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(Color(hex: "#FFD60A"))
+                    Text("Keyboard Shortcuts (when widget is selected/active):")
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+
+                HStack(spacing: 12) {
+                    HStack(spacing: 4) {
+                        Text("⌘ +")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.white.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                        Text("Make Larger")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.65))
+                    }
+
+                    HStack(spacing: 4) {
+                        Text("⌘ -")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.white.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                        Text("Make Smaller")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.65))
+                    }
+
+                    HStack(spacing: 4) {
+                        Text("⌘ 0")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.white.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                        Text("Reset 100%")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.65))
+                    }
+
+                    HStack(spacing: 4) {
+                        Text("⌘ R")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.white.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                        Text("Refresh")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.65))
+                    }
+                }
+            }
+            .padding(8)
+            .background(Color.white.opacity(0.03))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.white.opacity(0.06), lineWidth: 1))
         }
         .padding(14)
         .background(Color.white.opacity(0.04))
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
+    }
+
+    private func scalePresetButton(name: String, val: Double) -> some View {
+        let isSelected = abs(vm.widgetScale - val) < 0.02
+        return Button(action: {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                vm.widgetScale = val
+            }
+        }) {
+            Text(name)
+                .font(.system(size: 10, weight: .semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isSelected ? Color(hex: "#FF9F0A").opacity(0.3) : Color.white.opacity(0.06))
+                )
+                .foregroundColor(isSelected ? Color.white : Color.white.opacity(0.7))
+        }
+        .buttonStyle(.plain)
     }
 
     private func presetButton(name: String, val: Double) -> some View {
@@ -7443,6 +7612,8 @@ struct BatteryWidgetView: View {
             }
         }
         .frame(width: 212)
+        .scaleEffect(vm.widgetScale, anchor: .topLeading)
+        .frame(width: 212 * vm.widgetScale, alignment: .topLeading)
         .modifier(WindowDragModifier())
     }
 }
@@ -7480,6 +7651,7 @@ final class FloatingPanel: NSPanel {
 
 // MARK: - AppDelegate
 
+@MainActor
 @objc final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: FloatingPanel?
     private var historyPanel: FloatingPanel?
@@ -7575,8 +7747,9 @@ final class FloatingPanel: NSPanel {
         win.orderFrontRegardless()
     }
 
+    private var cancellables = Set<AnyCancellable>()
+
     private func buildPanel() {
-        let w: CGFloat = 212
         let content = BatteryWidgetView(
             vm: vm,
             onOpenHistory: { [weak self] in
@@ -7590,8 +7763,11 @@ final class FloatingPanel: NSPanel {
             let screen = p.screen ?? NSScreen.main ?? NSScreen.screens.first
             let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
             
-            let maxAvailableH = max(240, vis.height - 16)
-            let h = min(max(240, s.height), maxAvailableH)
+            let scale = self.vm.widgetScale
+            let targetW = max(140, 212.0 * scale)
+            let minH: CGFloat = 200.0 * scale
+            let maxAvailableH = max(minH, vis.height - 16)
+            let h = min(max(minH, s.height), maxAvailableH)
             
             var newY = frame.maxY - h
             // When widget is near the bottom edge of the screen, keep it above Dock / bottom border
@@ -7604,16 +7780,18 @@ final class FloatingPanel: NSPanel {
             
             var newX = frame.origin.x
             if newX < vis.minX + 8 { newX = vis.minX + 8 }
-            if newX + w > vis.maxX - 8 { newX = vis.maxX - 8 - w }
+            if newX + targetW > vis.maxX - 8 { newX = vis.maxX - 8 - targetW }
             
-            let newFrame = NSRect(x: newX, y: newY, width: w, height: h)
-            if abs(frame.height - h) < 1 && abs(frame.origin.x - newX) < 1 && abs(frame.origin.y - newY) < 1 {
+            let newFrame = NSRect(x: newX, y: newY, width: targetW, height: h)
+            if abs(frame.width - targetW) < 1 && abs(frame.height - h) < 1 && abs(frame.origin.x - newX) < 1 && abs(frame.origin.y - newY) < 1 {
                 return
             }
             p.setFrame(newFrame, display: true)
         }
 
-        let defaultSize = NSSize(width: w, height: 380)
+        let scale = vm.widgetScale
+        let initialW = max(140, 212.0 * scale)
+        let defaultSize = NSSize(width: initialW, height: 380 * scale)
         let p = FloatingPanel(
             contentRect: NSRect(origin: NSPoint(x: 1200, y: 300), size: defaultSize),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -7637,13 +7815,36 @@ final class FloatingPanel: NSPanel {
         p.setContentSize(defaultSize)
 
         panel = p
-        restoreFrame(w: w)
+        restoreFrame()
         p.orderFrontRegardless()
+
+        // Watch for widgetScale changes to re-trigger layout and resize the panel
+        vm.$widgetScale
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.hosting.invalidateIntrinsicContentSize()
+                self.hosting.layout()
+            }
+            .store(in: &cancellables)
 
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.modifierFlags.contains(.command) {
-                if event.characters == "q" { NSApp.terminate(nil); return nil }
-                if event.characters == "r" { Task { @MainActor in self?.vm.refresh(manual: true) }; return nil }
+                let chars = event.charactersIgnoringModifiers ?? event.characters ?? ""
+                if chars == "q" || chars == "Q" { NSApp.terminate(nil); return nil }
+                if chars == "r" || chars == "R" { Task { @MainActor in self?.vm.refresh(manual: true) }; return nil }
+                if chars == "+" || chars == "=" {
+                    Task { @MainActor in self?.vm.zoomIn() }
+                    return nil
+                }
+                if chars == "-" || chars == "_" {
+                    Task { @MainActor in self?.vm.zoomOut() }
+                    return nil
+                }
+                if chars == "0" {
+                    Task { @MainActor in self?.vm.resetZoom() }
+                    return nil
+                }
             }
             return event
         }
@@ -7656,13 +7857,16 @@ final class FloatingPanel: NSPanel {
 
     @objc private func windowMoved() { persistFrame() }
 
-    private func restoreFrame(w: CGFloat) {
+    private func restoreFrame() {
         guard let panel else { return }
         let screen = panel.screen ?? NSScreen.main ?? NSScreen.screens.first
         let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-        let maxAvailableH = max(240, vis.height - 16)
-        let rawH = hosting.fittingSize.height > 0 ? hosting.fittingSize.height : 380
-        let h = min(max(240, rawH), maxAvailableH)
+        let scale = vm.widgetScale
+        let w = max(140, 212.0 * scale)
+        let minH: CGFloat = 200.0 * scale
+        let maxAvailableH = max(minH, vis.height - 16)
+        let rawH = hosting.fittingSize.height > 0 ? hosting.fittingSize.height : (380 * scale)
+        let h = min(max(minH, rawH), maxAvailableH)
         
         let d = UserDefaults.standard
         var origin: NSPoint
