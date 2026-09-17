@@ -8,7 +8,7 @@ import Compression
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.2"
+    static let appVersion = "1.0.3"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -1161,10 +1161,99 @@ enum CoconutBatteryArchiveReader {
 }
 
 
+// MARK: - Capped subprocess (never leave a spinning child)
+
+enum CappedProcess {
+    /// SIGTERM the process group, then SIGKILL. Prevents orphaned `python -c` at PPID 1.
+    static func forceStop(_ proc: Process) {
+        let pid = proc.processIdentifier
+        guard pid > 1 else { return }
+        if setpgid(pid, pid) == 0 {
+            kill(-pid, SIGTERM)
+            usleep(80_000)
+            if proc.isRunning {
+                kill(-pid, SIGKILL)
+            }
+        } else {
+            kill(pid, SIGTERM)
+            usleep(80_000)
+            if proc.isRunning {
+                kill(pid, SIGKILL)
+            }
+        }
+        proc.waitUntilExit()
+    }
+
+    static func run(_ path: String, args: [String], timeout: TimeInterval) -> (status: Int32, stdout: Data)? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return nil }
+        let pid = proc.processIdentifier
+        _ = setpgid(pid, pid)
+        let start = Date()
+        while proc.isRunning && Date().timeIntervalSince(start) < timeout {
+            usleep(20_000)
+        }
+        if proc.isRunning {
+            forceStop(proc)
+            return nil
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return (proc.terminationStatus, data)
+    }
+
+    /// Reap leftover usbmuxd Python probes from older builds / crashed parents.
+    static func killStaleUsbmuxPython() {
+        guard let (_, data) = run("/bin/ps", args: ["-ax", "-o", "pid=,command="], timeout: 1.5),
+              let text = String(data: data, encoding: .utf8) else { return }
+        let selfPid = ProcessInfo.processInfo.processIdentifier
+        for line in text.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.contains("usbmuxd") || trimmed.contains("ProgName': 'BW'") || trimmed.contains("bw_1.0") else { continue }
+            guard trimmed.localizedCaseInsensitiveContains("python") else { continue }
+            let pidStr = trimmed.prefix(while: { $0.isNumber })
+            guard let pid = Int32(pidStr), pid > 1, pid != selfPid else { continue }
+            kill(pid, SIGTERM)
+            usleep(30_000)
+            kill(pid, SIGKILL)
+        }
+    }
+}
+
 // MARK: - iOS Device Reader via libimobiledevice
 
 enum iDeviceReader {
     static let brewBinPaths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+
+    /// Shared Python preamble: own process group, die on SIGTERM/ALRM, never busy-loop recv.
+    private static let pyGuard = """
+import os, signal
+try:
+    os.setpgrp()
+except Exception:
+    pass
+def _die(*_a):
+    os._exit(1)
+signal.signal(signal.SIGTERM, _die)
+signal.signal(signal.SIGINT, _die)
+if hasattr(signal, 'SIGALRM'):
+    signal.signal(signal.SIGALRM, _die)
+def recvn(sock, n, cap=4_000_000):
+    if n <= 0 or n > cap:
+        return b''
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(min(n - len(buf), 8192))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+"""
 
     static func tool(_ name: String) -> String? {
         brewBinPaths.map { "\($0)/\(name)" }.first {
@@ -1173,24 +1262,7 @@ enum iDeviceReader {
     }
 
     static func run(_ path: String, args: [String] = [], timeout: TimeInterval = 2.0) -> String? {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = args
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do { try proc.run() } catch { return nil }
-        
-        let start = Date()
-        while proc.isRunning && Date().timeIntervalSince(start) < timeout {
-            usleep(20_000) // 20ms
-        }
-        if proc.isRunning {
-            proc.terminate()
-            return nil
-        }
-        guard proc.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let (status, data) = CappedProcess.run(path, args: args, timeout: timeout), status == 0 else { return nil }
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -1199,23 +1271,19 @@ enum iDeviceReader {
         var rawResult: [(udid: String, isNetwork: Bool)] = []
         
         // 1. Query usbmuxd directly via lightweight python script
-        let pyScript = """
-import socket, plistlib, struct, json, signal
+        let pyScript = pyGuard + """
+import socket, plistlib, struct, json
+if hasattr(signal, 'alarm'): signal.alarm(2)
 try:
-    if hasattr(signal, 'alarm'): signal.alarm(2)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(1.2)
     s.connect('/var/run/usbmuxd')
     req = plistlib.dumps({'MessageType': 'ListDevices', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW'})
     s.sendall(struct.pack('<IIII', 16 + len(req), 1, 8, 1) + req)
-    hdr = s.recv(16)
+    hdr = recvn(s, 16)
     if len(hdr) >= 4:
         l = struct.unpack('<I', hdr[:4])[0]
-        payload = b''
-        while len(payload) < (l - 16):
-            chunk = s.recv(min((l - 16) - len(payload), 4096))
-            if not chunk: break
-            payload += chunk
+        payload = recvn(s, max(0, l - 16))
         devs = plistlib.loads(payload).get('DeviceList', [])
         res = []
         for d in devs:
@@ -1228,26 +1296,12 @@ try:
 except:
     print('[]')
 """
-        let pyProc = Process()
-        pyProc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        pyProc.arguments = ["-c", pyScript]
-        let pyPipe = Pipe()
-        pyProc.standardOutput = pyPipe
-        pyProc.standardError = Pipe()
-        if (try? pyProc.run()) != nil {
-            let start = Date()
-            while pyProc.isRunning && Date().timeIntervalSince(start) < 1.8 {
-                usleep(15_000)
-            }
-            if pyProc.isRunning {
-                pyProc.terminate()
-            } else if pyProc.terminationStatus == 0 {
-                let pyData = pyPipe.fileHandleForReading.readDataToEndOfFile()
-                struct PyDev: Codable { let udid: String; let isNetwork: Bool }
-                if let items = try? JSONDecoder().decode([PyDev].self, from: pyData) {
-                    for it in items {
-                        rawResult.append((it.udid, it.isNetwork))
-                    }
+        if let (status, pyData) = CappedProcess.run("/usr/bin/python3", args: ["-c", pyScript], timeout: 1.8),
+           status == 0 {
+            struct PyDev: Codable { let udid: String; let isNetwork: Bool }
+            if let items = try? JSONDecoder().decode([PyDev].self, from: pyData) {
+                for it in items {
+                    rawResult.append((it.udid, it.isNetwork))
                 }
             }
         }
@@ -1294,8 +1348,8 @@ except:
     private static func fetchViaUsbmuxd(udid: String, isNetwork: Bool? = nil) -> DeviceBatteryData? {
         let preferNet = isNetwork == true ? "True" : "False"
         let requireSpecificNet = isNetwork != nil ? "True" : "False"
-        let pyScript = """
-import socket, plistlib, struct, ssl, tempfile, os, json, sys, time, signal
+        let pyScript = pyGuard + """
+import socket, plistlib, struct, ssl, tempfile, os, json, sys, time
 
 def run():
     try:
@@ -1307,15 +1361,13 @@ def run():
         # 1. ListDevices
         req_list = plistlib.dumps({'MessageType': 'ListDevices', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW'})
         s.sendall(struct.pack('<IIII', 16 + len(req_list), 1, 8, 1) + req_list)
-        hdr = s.recv(16)
+        hdr = recvn(s, 16)
         if len(hdr) < 4:
             print('{}'); return
         l = struct.unpack('<I', hdr[:4])[0]
-        payload = b''
-        while len(payload) < (l - 16):
-            chunk = s.recv(min((l - 16) - len(payload), 4096))
-            if not chunk: break
-            payload += chunk
+        payload = recvn(s, max(0, l - 16))
+        if len(payload) < max(0, l - 16):
+            print('{}'); return
         devs = plistlib.loads(payload).get('DeviceList', [])
         
         target = None
@@ -1345,15 +1397,11 @@ def run():
         # 2. ReadPairRecord
         req_pair = plistlib.dumps({'MessageType': 'ReadPairRecord', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW', 'PairRecordID': dev_udid})
         s.sendall(struct.pack('<IIII', 16 + len(req_pair), 1, 8, 2) + req_pair)
-        hdr = s.recv(16)
+        hdr = recvn(s, 16)
         if len(hdr) < 4:
             print('{}'); return
         l = struct.unpack('<I', hdr[:4])[0]
-        pair_payload = b''
-        while len(pair_payload) < (l - 16):
-            chunk = s.recv(min((l - 16) - len(pair_payload), 4096))
-            if not chunk: break
-            pair_payload += chunk
+        pair_payload = recvn(s, max(0, l - 16))
         pair_resp = plistlib.loads(pair_payload)
         pair_data = pair_resp.get('PairRecordData')
         if not pair_data:
@@ -1365,26 +1413,21 @@ def run():
         port_be = ((62078 & 0xFF) << 8) | ((62078 >> 8) & 0xFF)
         c_req = plistlib.dumps({'MessageType': 'Connect', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW', 'DeviceID': device_id, 'PortNumber': port_be})
         s.sendall(struct.pack('<IIII', 16 + len(c_req), 1, 8, 3) + c_req)
-        hdr = s.recv(16)
+        hdr = recvn(s, 16)
         if len(hdr) < 4:
             print('{}'); return
         l = struct.unpack('<I', hdr[:4])[0]
-        s.recv(l - 16)
+        _ = recvn(s, max(0, l - 16))
         
         # 4. Lockdown exchange helper with strict bounds
         def send_lockdown(sock, d):
             raw = plistlib.dumps(d)
             sock.sendall(struct.pack('>I', len(raw)) + raw)
-            header = sock.recv(4)
+            header = recvn(sock, 4)
             if not header or len(header) < 4:
                 return {}
             l = struct.unpack('>I', header)[0]
-            buf = b''
-            while len(buf) < l:
-                chunk = sock.recv(min(l - len(buf), 8192))
-                if not chunk:
-                    break
-                buf += chunk
+            buf = recvn(sock, l)
             if len(buf) < l:
                 return {}
             try:
@@ -1434,10 +1477,10 @@ def run():
                 p_be = ((diag_port & 0xFF) << 8) | ((diag_port >> 8) & 0xFF)
                 c_req = plistlib.dumps({'MessageType': 'Connect', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW', 'DeviceID': device_id, 'PortNumber': p_be})
                 s_diag.sendall(struct.pack('<IIII', 16 + len(c_req), 1, 8, 4) + c_req)
-                hdr = s_diag.recv(16)
+                hdr = recvn(s_diag, 16)
                 if len(hdr) >= 4:
                     l = struct.unpack('<I', hdr[:4])[0]
-                    s_diag.recv(l - 16)
+                    _ = recvn(s_diag, max(0, l - 16))
                     
                     diag_sock = s_diag
                     if diag_serv.get('EnableServiceSSL'):
@@ -1550,24 +1593,8 @@ def run():
 
 run()
 """
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        proc.arguments = ["-c", pyScript]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        guard (try? proc.run()) != nil else { return nil }
-        
-        let start = Date()
-        while proc.isRunning && Date().timeIntervalSince(start) < 2.5 {
-            usleep(20_000)
-        }
-        if proc.isRunning {
-            proc.terminate()
-            return nil
-        }
-        guard proc.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let (status, data) = CappedProcess.run("/usr/bin/python3", args: ["-c", pyScript], timeout: 2.8),
+              status == 0 else { return nil }
         struct NativeDevInfo: Codable {
             let udid: String?
             let isNetwork: Bool?
@@ -7468,6 +7495,7 @@ final class FloatingPanel: NSPanel {
             NSApp.terminate(nil)
             return
         }
+        CappedProcess.killStaleUsbmuxPython()
         NSApp.setActivationPolicy(.regular)
         vm = BatteryWidgetViewModel()
         buildPanel()
@@ -7672,6 +7700,7 @@ final class FloatingPanel: NSPanel {
     func applicationWillTerminate(_ note: Notification) {
         persistFrame()
         vm?.savePersisted()
+        CappedProcess.killStaleUsbmuxPython()
     }
 }
 
