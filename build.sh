@@ -18,7 +18,13 @@ else
   echo "⚙️  Compiling iPhoneBatteryWidget.swift (Fast Build)…"
 fi
 
+SDK_FLAGS=()
+if [[ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" ]]; then
+  SDK_FLAGS+=("-sdk" "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk")
+fi
+
 swiftc $OPT_FLAG -j 8 -parse-as-library \
+  "${SDK_FLAGS[@]}" \
   -o "$BIN/iPhoneBatteryWidget" \
   "$ROOT/iPhoneBatteryWidget.swift" \
   -framework Cocoa -framework SwiftUI \
