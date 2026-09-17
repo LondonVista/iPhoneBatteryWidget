@@ -8,7 +8,7 @@ import Compression
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.1"
+    static let appVersion = "1.0.2"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -164,24 +164,39 @@ private let kIOSPollInterval: TimeInterval = 3.0
 // MARK: - Privacy & Standardized Device Name Resolver
 
 func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: String? = nil, deviceType: DeviceType? = nil) -> String {
+    if deviceId == "local_mac" || deviceType == .mac || (model?.lowercased().contains("mac") ?? false) {
+        return "MacBook Air"
+    }
+    
     if let n = name, !n.isEmpty {
         let lower = n.lowercased()
         if lower.contains("mac") {
             return "MacBook Air"
         }
-        if lower.contains("15") && (lower.contains("iphone") || lower.contains("old")) {
-            return "iPhone 15"
+        let cleaned = cleanDeviceDisplayName(n, fallback: "")
+        if !cleaned.isEmpty && cleaned != "iPhone" && cleaned != "iPad" {
+            return cleaned
         }
-        if lower.contains("iphone") || lower.contains("17") {
+    }
+    
+    if let m = model, !m.isEmpty {
+        if m.contains("18,1") || m.lowercased().contains("17 pro") {
             return "J. iPhone 17 Pro"
         }
-        return cleanDeviceDisplayName(n, fallback: "iPhone")
+        if m.contains("15,4") || m.lowercased().contains("iphone 15") {
+            return "iPhone 15"
+        }
+        if !m.hasPrefix("iPhone") && !m.hasPrefix("iPad") {
+            return m
+        }
+        if let (mkt, _) = AppleModelDatabase.lookupReleaseDate(model: m) {
+            return mkt
+        }
+        return m
     }
-    if deviceId == "local_mac" || deviceType == .mac || (model?.lowercased().contains("mac") ?? false) {
-        return "MacBook Air"
-    }
-    if (deviceId?.contains("26cc71869") ?? false) || (model?.contains("15") ?? false) {
-        return "iPhone 15"
+    
+    if deviceType == .ipad {
+        return "iPad"
     }
     return "J. iPhone 17 Pro"
 }
@@ -189,13 +204,13 @@ func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: S
 func canonicalDeviceModelName(model: String?, name: String? = nil, deviceId: String? = nil, deviceType: DeviceType? = nil) -> String {
     if let m = model, !m.isEmpty {
         let lower = m.lowercased()
-        if lower.contains("18,1") || lower.contains("17") || (lower.contains("iphone") && !lower.contains("15") && !lower.contains("mac")) {
+        if lower.contains("18,1") || lower.contains("17 pro") {
             return "iPhone18,1"
         }
         if lower.contains("mac") || lower.contains("macbookair10") {
             return "MacBookAir10,1"
         }
-        if lower.contains("15") {
+        if lower.contains("15,4") || lower.contains("iphone 15") {
             return "iPhone15,4"
         }
         return m
@@ -610,7 +625,7 @@ enum MacBatteryReader {
     private static var packTick = 0
     private static var lastTempC: Double?
 
-    private static func run(_ path: String, _ args: [String]) -> String {
+    private static func run(_ path: String, _ args: [String], timeout: TimeInterval = 1.5) -> String {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: path)
         task.arguments = args
@@ -618,7 +633,15 @@ enum MacBatteryReader {
         task.standardOutput = pipe
         task.standardError = Pipe()
         do { try task.run() } catch { return "" }
-        task.waitUntilExit()
+        let start = Date()
+        while task.isRunning && Date().timeIntervalSince(start) < timeout {
+            usleep(15_000)
+        }
+        if task.isRunning {
+            task.terminate()
+            return ""
+        }
+        guard task.terminationStatus == 0 else { return "" }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""
     }
@@ -1173,27 +1196,34 @@ enum iDeviceReader {
 
     /// List connected USB & Network device UDIDs via native usbmuxd and idevice_id
     static func listConnectedUDIDs() -> [(udid: String, isNetwork: Bool)] {
-        var result: [(udid: String, isNetwork: Bool)] = []
+        var rawResult: [(udid: String, isNetwork: Bool)] = []
         
         // 1. Query usbmuxd directly via lightweight python script
         let pyScript = """
-import socket, plistlib, struct, json
+import socket, plistlib, struct, json, signal
 try:
+    if hasattr(signal, 'alarm'): signal.alarm(2)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(1.5)
+    s.settimeout(1.2)
     s.connect('/var/run/usbmuxd')
     req = plistlib.dumps({'MessageType': 'ListDevices', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW'})
     s.sendall(struct.pack('<IIII', 16 + len(req), 1, 8, 1) + req)
     hdr = s.recv(16)
-    l = struct.unpack('<I', hdr[:4])[0]
-    devs = plistlib.loads(s.recv(l - 16)).get('DeviceList', [])
-    res = []
-    for d in devs:
-        p = d.get('Properties', {})
-        udid = p.get('SerialNumber')
-        if udid:
-            res.append({'udid': udid, 'isNetwork': p.get('ConnectionType') == 'Network'})
-    print(json.dumps(res))
+    if len(hdr) >= 4:
+        l = struct.unpack('<I', hdr[:4])[0]
+        payload = b''
+        while len(payload) < (l - 16):
+            chunk = s.recv(min((l - 16) - len(payload), 4096))
+            if not chunk: break
+            payload += chunk
+        devs = plistlib.loads(payload).get('DeviceList', [])
+        res = []
+        for d in devs:
+            p = d.get('Properties', {})
+            udid = p.get('SerialNumber')
+            if udid:
+                res.append({'udid': udid, 'isNetwork': p.get('ConnectionType') == 'Network'})
+        print(json.dumps(res))
     s.close()
 except:
     print('[]')
@@ -1205,53 +1235,88 @@ except:
         pyProc.standardOutput = pyPipe
         pyProc.standardError = Pipe()
         if (try? pyProc.run()) != nil {
-            pyProc.waitUntilExit()
-            let pyData = pyPipe.fileHandleForReading.readDataToEndOfFile()
-            struct PyDev: Codable { let udid: String; let isNetwork: Bool }
-            if let items = try? JSONDecoder().decode([PyDev].self, from: pyData) {
-                for it in items {
-                    result.append((it.udid, it.isNetwork))
+            let start = Date()
+            while pyProc.isRunning && Date().timeIntervalSince(start) < 1.8 {
+                usleep(15_000)
+            }
+            if pyProc.isRunning {
+                pyProc.terminate()
+            } else if pyProc.terminationStatus == 0 {
+                let pyData = pyPipe.fileHandleForReading.readDataToEndOfFile()
+                struct PyDev: Codable { let udid: String; let isNetwork: Bool }
+                if let items = try? JSONDecoder().decode([PyDev].self, from: pyData) {
+                    for it in items {
+                        rawResult.append((it.udid, it.isNetwork))
+                    }
                 }
             }
         }
 
         // 2. Fallback to idevice_id if usbmuxd didn't return devices
-        if result.isEmpty, let toolId = tool("idevice_id") {
+        if rawResult.isEmpty, let toolId = tool("idevice_id") {
             if let out = run(toolId, args: ["-l"], timeout: 1.5) {
                 for line in out.components(separatedBy: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
-                    result.append((line.trimmingCharacters(in: .whitespaces), false))
+                    rawResult.append((line.trimmingCharacters(in: .whitespaces), false))
                 }
             }
             if let outNet = run(toolId, args: ["-n"], timeout: 2.0) {
                 for line in outNet.components(separatedBy: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
                     let trimmed = line.trimmingCharacters(in: .whitespaces)
-                    if !result.contains(where: { $0.udid == trimmed }) {
-                        result.append((trimmed, true))
+                    if !rawResult.contains(where: { $0.udid == trimmed }) {
+                        rawResult.append((trimmed, true))
                     }
                 }
             }
         }
-        return result
+
+        // 3. Deduplicate: If device is connected via USB, prioritize USB and ignore duplicate Wi-Fi entry
+        var seenUSB: Set<String> = []
+        for it in rawResult where !it.isNetwork {
+            seenUSB.insert(it.udid)
+        }
+        var uniqueResult: [(udid: String, isNetwork: Bool)] = []
+        var seenAll: Set<String> = []
+        for it in rawResult where !it.isNetwork {
+            if !seenAll.contains(it.udid) {
+                seenAll.insert(it.udid)
+                uniqueResult.append(it)
+            }
+        }
+        for it in rawResult where it.isNetwork {
+            if !seenUSB.contains(it.udid) && !seenAll.contains(it.udid) {
+                seenAll.insert(it.udid)
+                uniqueResult.append(it)
+            }
+        }
+        return uniqueResult
     }
 
     private static func fetchViaUsbmuxd(udid: String, isNetwork: Bool? = nil) -> DeviceBatteryData? {
         let preferNet = isNetwork == true ? "True" : "False"
         let requireSpecificNet = isNetwork != nil ? "True" : "False"
         let pyScript = """
-import socket, plistlib, struct, ssl, tempfile, os, json, sys, time
+import socket, plistlib, struct, ssl, tempfile, os, json, sys, time, signal
 
 def run():
     try:
+        if hasattr(signal, 'alarm'): signal.alarm(3)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(2.5)
+        s.settimeout(1.8)
         s.connect('/var/run/usbmuxd')
         
         # 1. ListDevices
         req_list = plistlib.dumps({'MessageType': 'ListDevices', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW'})
         s.sendall(struct.pack('<IIII', 16 + len(req_list), 1, 8, 1) + req_list)
         hdr = s.recv(16)
+        if len(hdr) < 4:
+            print('{}'); return
         l = struct.unpack('<I', hdr[:4])[0]
-        devs = plistlib.loads(s.recv(l - 16)).get('DeviceList', [])
+        payload = b''
+        while len(payload) < (l - 16):
+            chunk = s.recv(min((l - 16) - len(payload), 4096))
+            if not chunk: break
+            payload += chunk
+        devs = plistlib.loads(payload).get('DeviceList', [])
         
         target = None
         # Sort so USB (wired) devices always come before Network devices
@@ -1281,8 +1346,15 @@ def run():
         req_pair = plistlib.dumps({'MessageType': 'ReadPairRecord', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW', 'PairRecordID': dev_udid})
         s.sendall(struct.pack('<IIII', 16 + len(req_pair), 1, 8, 2) + req_pair)
         hdr = s.recv(16)
+        if len(hdr) < 4:
+            print('{}'); return
         l = struct.unpack('<I', hdr[:4])[0]
-        pair_resp = plistlib.loads(s.recv(l - 16))
+        pair_payload = b''
+        while len(pair_payload) < (l - 16):
+            chunk = s.recv(min((l - 16) - len(pair_payload), 4096))
+            if not chunk: break
+            pair_payload += chunk
+        pair_resp = plistlib.loads(pair_payload)
         pair_data = pair_resp.get('PairRecordData')
         if not pair_data:
             print('{}')
@@ -1294,21 +1366,31 @@ def run():
         c_req = plistlib.dumps({'MessageType': 'Connect', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW', 'DeviceID': device_id, 'PortNumber': port_be})
         s.sendall(struct.pack('<IIII', 16 + len(c_req), 1, 8, 3) + c_req)
         hdr = s.recv(16)
+        if len(hdr) < 4:
+            print('{}'); return
         l = struct.unpack('<I', hdr[:4])[0]
-        conn_res = plistlib.loads(s.recv(l - 16))
-        if conn_res.get('Number', -1) != 0:
-            print('{}')
-            return
-            
-        # 4. Lockdown exchange
+        s.recv(l - 16)
+        
+        # 4. Lockdown exchange helper with strict bounds
         def send_lockdown(sock, d):
             raw = plistlib.dumps(d)
             sock.sendall(struct.pack('>I', len(raw)) + raw)
-            l = struct.unpack('>I', sock.recv(4))[0]
+            header = sock.recv(4)
+            if not header or len(header) < 4:
+                return {}
+            l = struct.unpack('>I', header)[0]
             buf = b''
             while len(buf) < l:
-                buf += sock.recv(l - len(buf))
-            return plistlib.loads(buf)
+                chunk = sock.recv(min(l - len(buf), 8192))
+                if not chunk:
+                    break
+                buf += chunk
+            if len(buf) < l:
+                return {}
+            try:
+                return plistlib.loads(buf)
+            except:
+                return {}
             
         ss_resp = send_lockdown(s, {'Request': 'StartSession', 'HostID': pair_rec['HostID'], 'SystemBUID': pair_rec['SystemBUID'], 'Label': 'BW'})
         
@@ -1325,6 +1407,7 @@ def run():
             os.unlink(c_p)
             os.unlink(k_p)
             sock_to_use = ctx.wrap_socket(s)
+            sock_to_use.settimeout(1.8)
             
         base_info = send_lockdown(sock_to_use, {'Request': 'GetValue', 'Label': 'BW'}).get('Value', {})
         batt_info = send_lockdown(sock_to_use, {'Request': 'GetValue', 'Domain': 'com.apple.mobile.battery', 'Label': 'BW'}).get('Value', {})
@@ -1352,85 +1435,78 @@ def run():
                 c_req = plistlib.dumps({'MessageType': 'Connect', 'ClientVersionString': 'bw_1.0', 'ProgName': 'BW', 'DeviceID': device_id, 'PortNumber': p_be})
                 s_diag.sendall(struct.pack('<IIII', 16 + len(c_req), 1, 8, 4) + c_req)
                 hdr = s_diag.recv(16)
-                l = struct.unpack('<I', hdr[:4])[0]
-                s_diag.recv(l - 16)
-                
-                diag_sock = s_diag
-                if diag_serv.get('EnableServiceSSL'):
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    with tempfile.NamedTemporaryFile('wb', delete=False) as f_c, tempfile.NamedTemporaryFile('wb', delete=False) as f_k:
-                        f_c.write(pair_rec['HostCertificate'])
-                        f_k.write(pair_rec['HostPrivateKey'])
-                        c_p, k_p = f_c.name, f_k.name
-                    ctx.load_cert_chain(c_p, k_p)
-                    os.unlink(c_p); os.unlink(k_p)
-                    diag_sock = ctx.wrap_socket(s_diag)
+                if len(hdr) >= 4:
+                    l = struct.unpack('<I', hdr[:4])[0]
+                    s_diag.recv(l - 16)
                     
-                # 1. Query AppleSmartBatteryPack for exact live hardware NTC thermistor Temperature
-                pack_res = send_lockdown(diag_sock, {'Request': 'IORegistry', 'EntryClass': 'AppleSmartBatteryPack'})
-                pack_reg = pack_res.get('Diagnostics', {}).get('IORegistry', {})
-                bdata = pack_reg.get('BatteryData', {})
-                
-                # Temperature is in centidegrees (e.g. 4179 -> 41.79 °C)
-                raw_temp = bdata.get('Temperature') or bdata.get('VirtualTemperature')
-                if raw_temp:
-                    temp = round(float(raw_temp) / 100.0, 1) if raw_temp > 100 else float(raw_temp)
-                
-                cycles = bdata.get('CycleCount') or pack_reg.get('CycleCount')
-                voltage = bdata.get('Voltage') or pack_reg.get('Voltage')
-                amperage = bdata.get('InstantAmperage') or bdata.get('Amperage')
-                des_mah = bdata.get('DesignCapacity')
-                fcc_mah = bdata.get('AppleRawMaxCapacity') or bdata.get('FullChargeCapacity')
-                rem_mah = bdata.get('AppleRawCurrentCapacity') or bdata.get('RemainingCapacity')
-                b_power = bdata.get('BatteryPower')
-                
-                # 2. Fallback to AppleSmartBattery for missing fields (like TimeRemaining)
-                pwr_res = send_lockdown(diag_sock, {'Request': 'IORegistry', 'EntryClass': 'AppleSmartBattery'})
-                reg = pwr_res.get('Diagnostics', {}).get('IORegistry', {})
-                if not cycles: cycles = reg.get('CycleCount')
-                if not voltage: voltage = reg.get('Voltage')
-                if not amperage: amperage = reg.get('InstantAmperage') or reg.get('Amperage')
-                time_rem = reg.get('TimeRemaining')
-                
-                if not bdata:
-                    bdata = reg.get('BatteryData', {})
-                    if not des_mah: des_mah = bdata.get('DesignCapacity')
-                    if not fcc_mah: fcc_mah = bdata.get('FullChargeCapacity')
-                    if not rem_mah: rem_mah = bdata.get('RemainingCapacity')
-                    if not b_power: b_power = bdata.get('BatteryPower')
-                
-                batt_mfg = bdata.get('ManufactureDate') or pack_reg.get('ManufactureDate') or reg.get('ManufactureDate')
-                first_use = bdata.get('DateOfFirstUse') or bdata.get('FirstUseDate') or pack_reg.get('DateOfFirstUse') or reg.get('DateOfFirstUse') or reg.get('FirstUseDate')
-                batt_serial = bdata.get('BatterySerialNumber') or pack_reg.get('BatterySerialNumber') or reg.get('BatterySerialNumber') or reg.get('Serial')
-
-                uptime_sec = None
-                try:
-                    pm = send_lockdown(diag_sock, {'Request': 'IORegistry', 'EntryClass': 'IOPMrootDomain'})
-                    preg = (pm.get('Diagnostics') or {}).get('IORegistry') or {}
-                    for key in ('SystemUptime', 'Uptime', 'TimeSinceBoot', 'BootTime', 'AbsoluteTime'):
-                        v = preg.get(key)
-                        if isinstance(v, (int, float)) and v > 30 and v < 10_000_000:
-                            uptime_sec = int(v)
-                            break
-                    if uptime_sec is None:
-                        mg = send_lockdown(diag_sock, {'Request': 'MobileGestalt', 'MobileGestaltKeys': ['LastBootTime', 'DiskUsage']})
-                        mgv = (mg.get('Diagnostics') or {}).get('MobileGestalt') or mg.get('MobileGestalt') or {}
-                        v = mgv.get('LastBootTime')
-                        if isinstance(v, (int, float)) and v > 1_000_000_000:
-                            uptime_sec = int(time.time() - float(v))
-                except Exception:
-                    pass
-
-                if des_mah and fcc_mah and des_mah > 0:
-                    health_pct = round((fcc_mah / des_mah) * 100.0, 1)
-                if b_power:
-                    watts = round(b_power / 1000.0, 1)
-                elif amperage and voltage:
-                    watts = round((abs(amperage) * voltage) / 1000000.0, 1)
+                    diag_sock = s_diag
+                    if diag_serv.get('EnableServiceSSL'):
+                        diag_sock = ctx.wrap_socket(s_diag)
+                        diag_sock.settimeout(1.5)
+                        
+                    # 1. Query AppleSmartBatteryPack for exact live hardware NTC thermistor Temperature
+                    pack_res = send_lockdown(diag_sock, {'Request': 'IORegistry', 'EntryClass': 'AppleSmartBatteryPack'})
+                    pack_reg = pack_res.get('Diagnostics', {}).get('IORegistry', {})
+                    bdata = pack_reg.get('BatteryData', {})
                     
-                diag_sock.close()
+                    # Temperature is in centidegrees (e.g. 4179 -> 41.79 °C)
+                    raw_temp = bdata.get('Temperature') or bdata.get('VirtualTemperature')
+                    if raw_temp:
+                        temp = round(float(raw_temp) / 100.0, 1) if raw_temp > 100 else float(raw_temp)
+                    
+                    cycles = bdata.get('CycleCount') or pack_reg.get('CycleCount')
+                    voltage = bdata.get('Voltage') or pack_reg.get('Voltage')
+                    amperage = bdata.get('InstantAmperage') or bdata.get('Amperage')
+                    des_mah = bdata.get('DesignCapacity')
+                    fcc_mah = bdata.get('AppleRawMaxCapacity') or bdata.get('FullChargeCapacity')
+                    rem_mah = bdata.get('AppleRawCurrentCapacity') or bdata.get('RemainingCapacity')
+                    b_power = bdata.get('BatteryPower')
+                    
+                    # 2. Fallback to AppleSmartBattery for missing fields (like TimeRemaining)
+                    pwr_res = send_lockdown(diag_sock, {'Request': 'IORegistry', 'EntryClass': 'AppleSmartBattery'})
+                    reg = pwr_res.get('Diagnostics', {}).get('IORegistry', {})
+                    if not cycles: cycles = reg.get('CycleCount')
+                    if not voltage: voltage = reg.get('Voltage')
+                    if not amperage: amperage = reg.get('InstantAmperage') or reg.get('Amperage')
+                    time_rem = reg.get('TimeRemaining')
+                    
+                    if not bdata:
+                        bdata = reg.get('BatteryData', {})
+                        if not des_mah: des_mah = bdata.get('DesignCapacity')
+                        if not fcc_mah: fcc_mah = bdata.get('FullChargeCapacity')
+                        if not rem_mah: rem_mah = bdata.get('RemainingCapacity')
+                        if not b_power: b_power = bdata.get('BatteryPower')
+                    
+                    batt_mfg = bdata.get('ManufactureDate') or pack_reg.get('ManufactureDate') or reg.get('ManufactureDate')
+                    first_use = bdata.get('DateOfFirstUse') or bdata.get('FirstUseDate') or pack_reg.get('DateOfFirstUse') or reg.get('DateOfFirstUse') or reg.get('FirstUseDate')
+                    batt_serial = bdata.get('BatterySerialNumber') or pack_reg.get('BatterySerialNumber') or reg.get('BatterySerialNumber') or reg.get('Serial')
+
+                    uptime_sec = None
+                    try:
+                        pm = send_lockdown(diag_sock, {'Request': 'IORegistry', 'EntryClass': 'IOPMrootDomain'})
+                        preg = (pm.get('Diagnostics') or {}).get('IORegistry') or {}
+                        for key in ('SystemUptime', 'Uptime', 'TimeSinceBoot', 'BootTime', 'AbsoluteTime'):
+                            v = preg.get(key)
+                            if isinstance(v, (int, float)) and v > 30 and v < 10_000_000:
+                                uptime_sec = int(v)
+                                break
+                        if uptime_sec is None:
+                            mg = send_lockdown(diag_sock, {'Request': 'MobileGestalt', 'MobileGestaltKeys': ['LastBootTime', 'DiskUsage']})
+                            mgv = (mg.get('Diagnostics') or {}).get('MobileGestalt') or mg.get('MobileGestalt') or {}
+                            v = mgv.get('LastBootTime')
+                            if isinstance(v, (int, float)) and v > 1_000_000_000:
+                                uptime_sec = int(time.time() - float(v))
+                    except Exception:
+                        pass
+
+                    if des_mah and fcc_mah and des_mah > 0:
+                        health_pct = round((fcc_mah / des_mah) * 100.0, 1)
+                    if b_power:
+                        watts = round(b_power / 1000.0, 1)
+                    elif amperage and voltage:
+                        watts = round((abs(amperage) * voltage) / 1000000.0, 1)
+                        
+                    diag_sock.close()
         except Exception as e:
             pass
             
@@ -1481,8 +1557,16 @@ run()
         proc.standardOutput = pipe
         proc.standardError = Pipe()
         guard (try? proc.run()) != nil else { return nil }
-        proc.waitUntilExit()
         
+        let start = Date()
+        while proc.isRunning && Date().timeIntervalSince(start) < 2.5 {
+            usleep(20_000)
+        }
+        if proc.isRunning {
+            proc.terminate()
+            return nil
+        }
+        guard proc.terminationStatus == 0 else { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         struct NativeDevInfo: Codable {
             let udid: String?
@@ -1663,7 +1747,7 @@ run()
         // 1. General Info & Battery Domain
         guard let battRaw = run(infoTool, args: udidArgs + ["-q", "com.apple.mobile.battery"], timeout: timeoutSec),
               !battRaw.isEmpty else {
-            return fetchViaUsbmuxd(udid: udid, isNetwork: isNetwork)
+            return nil
         }
         let battDict = parseKV(battRaw)
         
@@ -1873,9 +1957,16 @@ final class MacLidTracker {
     static let shared = MacLidTracker()
 
     func fetchAllLidSessions() -> [LidSession] {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        df.timeZone = TimeZone.current
+
+        let sevenDaysAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
+        let startStr = df.string(from: sevenDaysAgo)
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        proc.arguments = ["-g", "log"]
+        proc.arguments = ["-g", "log", "--start", startStr]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = Pipe()
@@ -1885,15 +1976,19 @@ final class MacLidTracker {
             return []
         }
 
+        let start = Date()
+        while proc.isRunning && Date().timeIntervalSince(start) < 2.0 {
+            usleep(20_000)
+        }
+        if proc.isRunning {
+            proc.terminate()
+            return []
+        }
+        guard proc.terminationStatus == 0 else { return [] }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        proc.waitUntilExit()
         guard let output = String(data: data, encoding: .utf8) else {
             return []
         }
-
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        df.timeZone = TimeZone.current
 
         var rawOpens: [Date] = []
         var rawCloses: [Date] = []
@@ -2026,6 +2121,8 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var recentTempSamples: [String: [(date: Date, temp: Double)]] = [:]
     private var timer: Timer?
     private var isBusy = false
+    private var isIOSBusy = false
+    private var lastMacData: DeviceBatteryData?
     private var lastIOSFetchAt: Date = .distantPast
     private var lastIOSDevices: [DeviceBatteryData] = []
     private var lastUDIDs: [(String, Bool)] = []
@@ -2282,215 +2379,201 @@ final class BatteryWidgetViewModel: ObservableObject {
     }
 
     func refresh(manual: Bool) {
-        guard !isBusy else { return }
-        isBusy = true
         if manual { isRefreshing = true }
 
-        let shouldFetchIOS = manual || Date().timeIntervalSince(lastIOSFetchAt) >= kIOSPollInterval
-        let cachedUDIDs = lastUDIDs
-        let cachedIOS = lastIOSDevices
-
-        Task.detached(priority: .utility) { [weak self] in
+        // 1. Fetch Mac telemetry asynchronously and apply immediately to avoid UI stalling
+        Task.detached(priority: .userInitiated) { [weak self] in
             let macData = MacBatteryReader.fetch()
-            var connectedUDIDs = cachedUDIDs
-            var iosDevices = cachedIOS
-            if shouldFetchIOS {
-                connectedUDIDs = iDeviceReader.listConnectedUDIDs()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.lastMacData = macData
+                self.considerPDHandshakeHint(macData)
+                self.rebuildDevicesList()
+                if manual && !self.isIOSBusy {
+                    self.isRefreshing = false
+                }
+            }
+        }
+
+        // 2. Fetch iOS devices periodically or on manual trigger without blocking Mac updates
+        let shouldFetchIOS = manual || Date().timeIntervalSince(lastIOSFetchAt) >= kIOSPollInterval
+        if shouldFetchIOS && !isIOSBusy {
+            isIOSBusy = true
+            Task.detached(priority: .utility) { [weak self] in
+                let connectedUDIDs = iDeviceReader.listConnectedUDIDs()
                 var list: [DeviceBatteryData] = []
                 for (udid, isNet) in connectedUDIDs {
                     if let dev = iDeviceReader.fetchDevice(udid: udid, isNetwork: isNet) {
                         list.append(dev)
                     }
                 }
-                iosDevices = list
-            }
-            let udidsDone = connectedUDIDs
-            let iosDone = iosDevices
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.applyRefresh(
-                    macData: macData,
-                    connectedUDIDs: udidsDone,
-                    iosDevices: iosDone,
-                    didFetchIOS: shouldFetchIOS,
-                    manual: manual
-                )
+                let fetchedList = list
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.lastIOSFetchAt = Date()
+                    self.lastUDIDs = connectedUDIDs
+                    self.lastIOSDevices = fetchedList
+                    self.isIOSBusy = false
+                    if manual { self.isRefreshing = false }
+                    
+                    let isPhoneConnectedNow = fetchedList.contains(where: { $0.deviceType != .mac && $0.isConnected && !$0.isWirelesslyConnected })
+                        && connectedUDIDs.contains(where: { !$0.0.contains("local") && !$0.0.contains("26cc71869") && !$0.1 })
+                    self.considerIPhoneConnectionSound(connected: isPhoneConnectedNow)
+                    
+                    self.rebuildDevicesList()
+                }
             }
         }
     }
 
-    private func applyRefresh(
-        macData: DeviceBatteryData,
-        connectedUDIDs: [(String, Bool)],
-        iosDevices: [DeviceBatteryData],
-        didFetchIOS: Bool,
-        manual: Bool
-    ) {
-        defer {
-            isBusy = false
-            if manual { isRefreshing = false }
-        }
-        if didFetchIOS {
-            lastIOSFetchAt = Date()
-            lastUDIDs = connectedUDIDs
-            lastIOSDevices = iosDevices
+    private func rebuildDevicesList() {
+        guard let currentMac = self.lastMacData ?? self.devices.first(where: { $0.id == "local_mac" }) else {
+            return
         }
 
-        considerPDHandshakeHint(macData)
-        if didFetchIOS {
-            let isPhoneConnectedNow = iosDevices.contains(where: { $0.deviceType != .mac && $0.isConnected && !$0.isWirelesslyConnected })
-                && connectedUDIDs.contains(where: { !$0.0.contains("local") && !$0.0.contains("26cc71869") && !$0.1 })
-            considerIPhoneConnectionSound(connected: isPhoneConnectedNow)
+        var updatedDevices = self.devices
+        let enrichedMac = self.enrichWithBatteryRate(currentMac)
+        if let idx = updatedDevices.firstIndex(where: { $0.id == "local_mac" }) {
+            updatedDevices[idx] = enrichedMac
+        } else {
+            updatedDevices.append(enrichedMac)
         }
 
-            // 3. Merge with cached data so disconnected devices remain visible with last known data
-            var updatedDevices = self.devices
-            
-            // Update or add Mac
-            let enrichedMac = self.enrichWithBatteryRate(macData)
-            if let idx = updatedDevices.firstIndex(where: { $0.id == "local_mac" }) {
-                updatedDevices[idx] = enrichedMac
-            } else {
-                updatedDevices.append(enrichedMac)
-            }
-            
-            // Mark previously known iOS devices as disconnected if not in active list
-            for i in 0..<updatedDevices.count {
-                if updatedDevices[i].deviceType != .mac {
-                    let isStillOnline = connectedUDIDs.contains(where: { $0.0 == updatedDevices[i].deviceId })
-                    if !isStillOnline && updatedDevices[i].isConnected {
-                        // Mark as disconnected right now
-                        let old = updatedDevices[i]
-                        updatedDevices[i] = DeviceBatteryData(
-                            deviceId: old.deviceId,
-                            deviceName: old.deviceName,
-                            deviceType: old.deviceType,
-                            isConnected: false,
-                            isWirelesslyConnected: false,
-                            capacityInt: old.capacityInt,
-                            capacityExact: old.capacityExact,
-                            isCharging: false,
-                            isFullyCharged: old.isFullyCharged,
-                            isACConnected: false,
-                            cycleCount: old.cycleCount,
-                            batteryHealthPct: old.batteryHealthPct,
-                            voltageMv: old.voltageMv,
-                            amperageMa: 0,
-                            chargingWatts: nil,
-                            ratePctPerHour: nil,
-                            temperatureC: old.temperatureC,
-                            timeRemainingMins: nil,
-                            remainingMah: old.remainingMah,
-                            fullChargeMah: old.fullChargeMah,
-                            designCapacityMah: old.designCapacityMah,
-                            totalDiskBytes: old.totalDiskBytes,
-                            freeDiskBytes: old.freeDiskBytes,
-                            batteryManufactureDate: old.batteryManufactureDate,
-                            deviceManufactureDate: old.deviceManufactureDate,
-                            firstUseDate: old.firstUseDate,
-                            modelReleaseDate: old.modelReleaseDate,
-                            lastSeenAt: Date(),
-                            processor: old.processor,
-                            hardwareModel: old.hardwareModel,
-                            serialNumber: old.serialNumber,
-                            fetchedAt: old.fetchedAt,
-                            pdHandshakeOn: old.pdHandshakeOn,
-                            pdInputVoltageV: old.pdInputVoltageV,
-                            pdAdapterWatts: old.pdAdapterWatts,
-                            systemLoadWatts: old.systemLoadWatts,
-                            adapterInWatts: old.adapterInWatts,
-                            uptimeSeconds: nil
-                        )
-                    }
+        // Mark previously known iOS devices as disconnected if not in active connectedUDIDs
+        for i in 0..<updatedDevices.count {
+            if updatedDevices[i].deviceType != .mac {
+                let isStillOnline = self.lastUDIDs.contains(where: { $0.0 == updatedDevices[i].deviceId })
+                if !isStillOnline && updatedDevices[i].isConnected {
+                    let old = updatedDevices[i]
+                    updatedDevices[i] = DeviceBatteryData(
+                        deviceId: old.deviceId,
+                        deviceName: old.deviceName,
+                        deviceType: old.deviceType,
+                        isConnected: false,
+                        isWirelesslyConnected: false,
+                        capacityInt: old.capacityInt,
+                        capacityExact: old.capacityExact,
+                        isCharging: false,
+                        isFullyCharged: old.isFullyCharged,
+                        isACConnected: false,
+                        cycleCount: old.cycleCount,
+                        batteryHealthPct: old.batteryHealthPct,
+                        voltageMv: old.voltageMv,
+                        amperageMa: 0,
+                        chargingWatts: nil,
+                        ratePctPerHour: nil,
+                        temperatureC: old.temperatureC,
+                        timeRemainingMins: nil,
+                        remainingMah: old.remainingMah,
+                        fullChargeMah: old.fullChargeMah,
+                        designCapacityMah: old.designCapacityMah,
+                        totalDiskBytes: old.totalDiskBytes,
+                        freeDiskBytes: old.freeDiskBytes,
+                        batteryManufactureDate: old.batteryManufactureDate,
+                        deviceManufactureDate: old.deviceManufactureDate,
+                        firstUseDate: old.firstUseDate,
+                        modelReleaseDate: old.modelReleaseDate,
+                        lastSeenAt: Date(),
+                        processor: old.processor,
+                        hardwareModel: old.hardwareModel,
+                        serialNumber: old.serialNumber,
+                        fetchedAt: old.fetchedAt,
+                        pdHandshakeOn: old.pdHandshakeOn,
+                        pdInputVoltageV: old.pdInputVoltageV,
+                        pdAdapterWatts: old.pdAdapterWatts,
+                        systemLoadWatts: old.systemLoadWatts,
+                        adapterInWatts: old.adapterInWatts,
+                        uptimeSeconds: nil
+                    )
                 }
             }
+        }
+
+        var finalDevices: [DeviceBatteryData] = []
+        finalDevices.append(enrichedMac)
+        self.recordHistory(enrichedMac)
+
+        let ip17Points = self.historyPoints.filter { pt in
+            pt.deviceType != .mac && pt.deviceId != "local_mac" && !pt.deviceId.contains("26cc71869") && !(pt.deviceName?.contains("15") ?? false)
+        }
+        let last17 = ip17Points.sorted(by: { $0.date < $1.date }).last
+
+        // Prefer wired (non-wireless) connection first if multiple entries exist
+        let preferredOnlinePhone = self.lastIOSDevices
+            .filter { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") }
+            .sorted(by: { (!$0.isWirelesslyConnected ? 0 : 1) < (!$1.isWirelesslyConnected ? 0 : 1) })
+            .first
+
+        if let onlinePhone = preferredOnlinePhone {
+            let enrichedPhone = self.enrichWithBatteryRate(onlinePhone)
+            finalDevices.insert(enrichedPhone, at: 0)
+            self.recordHistory(onlinePhone)
+            UserDefaults.standard.set(onlinePhone.capacityExact, forKey: "ibw.lastKnowniPhonePct")
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "ibw.lastKnowniPhoneDate")
+        } else if var cachedPhone = updatedDevices.first(where: { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") && !$0.deviceName.contains("15") }) {
+            cachedPhone.uptimeSeconds = nil
+            finalDevices.insert(cachedPhone, at: 0)
+        } else {
+            let lastKnownPct: Double = {
+                let saved = UserDefaults.standard.double(forKey: "ibw.lastKnowniPhonePct")
+                if saved > 0.0 { return saved }
+                return 74.0
+            }()
+            let fcc = last17?.fullChargeMah ?? 3908
+            let remMah = Int((lastKnownPct / 100.0) * Double(fcc))
             
-            // Strict deduplication: exactly 1 Mac and 1 iPhone 17 Pro (either live or offline authentic)
-            var finalDevices: [DeviceBatteryData] = []
-            finalDevices.append(enrichedMac)
-            self.recordHistory(enrichedMac)
-            
-            let ip17Points = self.historyPoints.filter { pt in
-                pt.deviceType != .mac && pt.deviceId != "local_mac" && !pt.deviceId.contains("26cc71869") && !(pt.deviceName?.contains("15") ?? false)
-            }
-            let last17 = ip17Points.sorted(by: { $0.date < $1.date }).last
+            let df = DateFormatter()
+            df.dateFormat = "yyyy-MM-dd"
+            let bDate = last17?.batteryManufactureDate ?? df.date(from: "2025-08-12")
+            let dDate = last17?.deviceManufactureDate ?? df.date(from: "2025-08-25")
+            let uDate = last17?.firstUseDate ?? df.date(from: "2025-09-20")
+            let rDate = df.date(from: "2025-09-09")
 
-            // Prefer wired (non-wireless) connection first if multiple entries exist
-            let preferredOnlinePhone = iosDevices
-                .filter { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") }
-                .sorted(by: { (!$0.isWirelesslyConnected ? 0 : 1) < (!$1.isWirelesslyConnected ? 0 : 1) })
-                .first
+            let synthDev = DeviceBatteryData(
+                deviceId: last17?.deviceId ?? "DJRXC6F3QC",
+                deviceName: canonicalDeviceDisplayName(name: last17?.deviceName, model: last17?.deviceModel, deviceId: last17?.deviceId ?? "DJRXC6F3QC", deviceType: .iphone),
+                deviceType: .iphone,
+                isConnected: false,
+                isWirelesslyConnected: false,
+                capacityInt: Int(lastKnownPct),
+                capacityExact: lastKnownPct,
+                isCharging: false,
+                isFullyCharged: false,
+                isACConnected: false,
+                cycleCount: last17?.cycleCount ?? 174,
+                batteryHealthPct: last17?.healthPct ?? 100.0,
+                voltageMv: 4120,
+                amperageMa: 0,
+                chargingWatts: nil,
+                ratePctPerHour: nil,
+                temperatureC: last17?.temperatureC ?? 26.5,
+                timeRemainingMins: nil,
+                remainingMah: remMah,
+                fullChargeMah: fcc,
+                designCapacityMah: last17?.designCapacityMah ?? 3998,
+                totalDiskBytes: 512_000_000_000,
+                freeDiskBytes: 340_000_000_000,
+                batteryManufactureDate: bDate,
+                deviceManufactureDate: dDate,
+                firstUseDate: uDate,
+                modelReleaseDate: rDate,
+                lastSeenAt: last17?.date ?? Date(),
+                processor: "Apple A19 Pro",
+                hardwareModel: last17?.deviceModel ?? "iPhone18,1",
+                serialNumber: last17?.deviceSerial ?? "DJRXC6F3QC",
+                fetchedAt: Date()
+            )
+            finalDevices.insert(synthDev, at: 0)
+        }
 
-            if let onlinePhone = preferredOnlinePhone {
-                let enrichedPhone = self.enrichWithBatteryRate(onlinePhone)
-                finalDevices.insert(enrichedPhone, at: 0)
-                self.recordHistory(onlinePhone)
-                UserDefaults.standard.set(onlinePhone.capacityExact, forKey: "ibw.lastKnowniPhonePct")
-                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "ibw.lastKnowniPhoneDate")
-            } else if var cachedPhone = updatedDevices.first(where: { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") && !$0.deviceName.contains("15") }) {
-                cachedPhone.uptimeSeconds = nil
-                finalDevices.insert(cachedPhone, at: 0)
-            } else {
-                let lastKnownPct: Double = {
-                    let saved = UserDefaults.standard.double(forKey: "ibw.lastKnowniPhonePct")
-                    if saved > 0.0 { return saved }
-                    return 74.0
-                }()
-                let fcc = last17?.fullChargeMah ?? 3908
-                let remMah = Int((lastKnownPct / 100.0) * Double(fcc))
-                
-                let df = DateFormatter()
-                df.dateFormat = "yyyy-MM-dd"
-                let bDate = last17?.batteryManufactureDate ?? df.date(from: "2025-08-12")
-                let dDate = last17?.deviceManufactureDate ?? df.date(from: "2025-08-25")
-                let uDate = last17?.firstUseDate ?? df.date(from: "2025-09-20")
-                let rDate = df.date(from: "2025-09-09")
-
-                let synthDev = DeviceBatteryData(
-                    deviceId: last17?.deviceId ?? "DJRXC6F3QC",
-                    deviceName: canonicalDeviceDisplayName(name: last17?.deviceName, model: last17?.deviceModel, deviceId: last17?.deviceId ?? "DJRXC6F3QC", deviceType: .iphone),
-                    deviceType: .iphone,
-                    isConnected: false,
-                    isWirelesslyConnected: false,
-                    capacityInt: Int(lastKnownPct),
-                    capacityExact: lastKnownPct,
-                    isCharging: false,
-                    isFullyCharged: false,
-                    isACConnected: false,
-                    cycleCount: last17?.cycleCount ?? 174,
-                    batteryHealthPct: last17?.healthPct ?? 100.0,
-                    voltageMv: 4120,
-                    amperageMa: 0,
-                    chargingWatts: nil,
-                    ratePctPerHour: nil,
-                    temperatureC: last17?.temperatureC ?? 26.5,
-                    timeRemainingMins: nil,
-                    remainingMah: remMah,
-                    fullChargeMah: fcc,
-                    designCapacityMah: last17?.designCapacityMah ?? 3998,
-                    totalDiskBytes: 512_000_000_000,
-                    freeDiskBytes: 340_000_000_000,
-                    batteryManufactureDate: bDate,
-                    deviceManufactureDate: dDate,
-                    firstUseDate: uDate,
-                    modelReleaseDate: rDate,
-                    lastSeenAt: last17?.date ?? Date(),
-                    processor: "Apple A19 Pro",
-                    hardwareModel: last17?.deviceModel ?? "iPhone18,1",
-                    serialNumber: last17?.deviceSerial ?? "DJRXC6F3QC",
-                    fetchedAt: Date()
-                )
-                finalDevices.insert(synthDev, at: 0)
-            }
-
-            let unchanged = devices.count == finalDevices.count
-                && zip(devices, finalDevices).allSatisfy { $0.liveEqual($1) }
-            if !unchanged {
-                devices = finalDevices
-                saveDevices()
-            }
-            consider80PercentChargeDing(devices: finalDevices)
-            if historyDirty { saveHistory() }
+        let unchanged = devices.count == finalDevices.count
+            && zip(devices, finalDevices).allSatisfy { $0.liveEqual($1) }
+        if !unchanged {
+            devices = finalDevices
+            saveDevices()
+        }
+        consider80PercentChargeDing(devices: finalDevices)
+        if historyDirty { saveHistory() }
     }
 
     private func enrichWithBatteryRate(_ dev: DeviceBatteryData) -> DeviceBatteryData {
