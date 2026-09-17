@@ -35,6 +35,7 @@ codesign --force --deep --sign - "$APP" 2>/dev/null || true
 
 if [[ -w /Applications ]]; then
   pkill -x iPhoneBatteryWidget 2>/dev/null || true
+  pkill -f "ClientVersionString': 'bw_1.0'" 2>/dev/null || true
   sleep 0.2
   rm -rf /Applications/iPhoneBatteryWidget.app
   cp -R "$APP" /Applications/iPhoneBatteryWidget.app
