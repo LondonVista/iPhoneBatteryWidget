@@ -1,6 +1,9 @@
 import Cocoa
 import SwiftUI
 import AVFoundation
+import AudioToolbox
+import UserNotifications
+import Darwin
 import IOKit.ps
 import CryptoKit
 import Compression
@@ -9,7 +12,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.4"
+    static let appVersion = "1.0.5"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -159,8 +162,8 @@ private let kCachedDevicesKey = "ibw.cachedDevicesData.v2"
 private let kHistoryLogKey = "ibw.batteryHistoryLog.v2"
 private let kLidHistoryLogKey = "ibw.lidHistoryLog.v1"
 private let kSelectedTabKey = "ibw.selectedDeviceTab"
-private let kPollInterval: TimeInterval = 2.0
-private let kIOSPollInterval: TimeInterval = 3.0
+private let kPollInterval: TimeInterval = 1.0
+private let kIOSPollInterval: TimeInterval = 1.0
 
 // MARK: - Privacy & Standardized Device Name Resolver
 
@@ -1267,12 +1270,94 @@ def recvn(sock, n, cap=4_000_000):
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Direct pure-Swift native UNIX socket query to /var/run/usbmuxd (< 1ms execution, zero subprocesses)
+    static func queryUsbmuxdNative() -> [(udid: String, isNetwork: Bool)] {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return [] }
+        defer { close(fd) }
+        
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let path = "/var/run/usbmuxd"
+        _ = path.withCString { strncpy(&addr.sun_path.0, $0, MemoryLayout.size(ofValue: addr.sun_path)) }
+        
+        var tv = timeval(tv_sec: 0, tv_usec: 400_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        
+        let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let connectRes = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, addrLen)
+            }
+        }
+        guard connectRes == 0 else { return [] }
+        
+        let reqDict: [String: Any] = [
+            "MessageType": "ListDevices",
+            "ClientVersionString": "bw_1.0",
+            "ProgName": "BW"
+        ]
+        guard let plistData = try? PropertyListSerialization.data(fromPropertyList: reqDict, format: .xml, options: 0) else {
+            return []
+        }
+        
+        var totalLen = UInt32(16 + plistData.count).littleEndian
+        var version = UInt32(1).littleEndian
+        var reqType = UInt32(8).littleEndian
+        var tag = UInt32(1).littleEndian
+        
+        var packet = Data()
+        withUnsafeBytes(of: &totalLen) { packet.append(contentsOf: $0) }
+        withUnsafeBytes(of: &version) { packet.append(contentsOf: $0) }
+        withUnsafeBytes(of: &reqType) { packet.append(contentsOf: $0) }
+        withUnsafeBytes(of: &tag) { packet.append(contentsOf: $0) }
+        packet.append(plistData)
+        
+        let sent = packet.withUnsafeBytes { send(fd, $0.baseAddress, packet.count, 0) }
+        guard sent == packet.count else { return [] }
+        
+        var hdrBuf = [UInt8](repeating: 0, count: 16)
+        let readBytes = recv(fd, &hdrBuf, 16, 0)
+        guard readBytes == 16 else { return [] }
+        
+        let replyLen = hdrBuf.withUnsafeBytes { $0.load(as: UInt32.self) }
+        let payloadLen = Int(replyLen) - 16
+        guard payloadLen > 0 && payloadLen < 1_000_000 else { return [] }
+        
+        var payloadBuf = [UInt8](repeating: 0, count: payloadLen)
+        var totalPayloadRead = 0
+        while totalPayloadRead < payloadLen {
+            let chunk = recv(fd, &payloadBuf[totalPayloadRead], payloadLen - totalPayloadRead, 0)
+            guard chunk > 0 else { break }
+            totalPayloadRead += chunk
+        }
+        guard totalPayloadRead == payloadLen else { return [] }
+        
+        let payloadData = Data(payloadBuf)
+        guard let plist = try? PropertyListSerialization.propertyList(from: payloadData, options: [], format: nil) as? [String: Any],
+              let devList = plist["DeviceList"] as? [[String: Any]] else {
+            return []
+        }
+        
+        var results: [(udid: String, isNetwork: Bool)] = []
+        for d in devList {
+            if let props = d["Properties"] as? [String: Any],
+               let serial = props["SerialNumber"] as? String {
+                let connType = props["ConnectionType"] as? String
+                results.append((udid: serial, isNetwork: connType == "Network"))
+            }
+        }
+        return results
+    }
+
     /// List connected USB & Network device UDIDs via native usbmuxd and idevice_id
     static func listConnectedUDIDs() -> [(udid: String, isNetwork: Bool)] {
-        var rawResult: [(udid: String, isNetwork: Bool)] = []
+        var rawResult = queryUsbmuxdNative()
         
-        // 1. Query usbmuxd directly via lightweight python script
-        let pyScript = pyGuard + """
+        // 1. Fallback to lightweight python query if native usbmuxd query returned nothing
+        if rawResult.isEmpty {
+            let pyScript = pyGuard + """
 import socket, plistlib, struct, json
 if hasattr(signal, 'alarm'): signal.alarm(2)
 try:
@@ -1291,18 +1376,19 @@ try:
             p = d.get('Properties', {})
             udid = p.get('SerialNumber')
             if udid:
-                res.append({'udid': udid, 'isNetwork': p.get('ConnectionType') == 'Network'})
+                res.append({'udid': str(udid), 'isNetwork': p.get('ConnectionType') == 'Network'})
         print(json.dumps(res))
     s.close()
 except:
     print('[]')
 """
-        if let (status, pyData) = CappedProcess.run("/usr/bin/python3", args: ["-c", pyScript], timeout: 1.8),
-           status == 0 {
-            struct PyDev: Codable { let udid: String; let isNetwork: Bool }
-            if let items = try? JSONDecoder().decode([PyDev].self, from: pyData) {
-                for it in items {
-                    rawResult.append((it.udid, it.isNetwork))
+            if let (status, pyData) = CappedProcess.run("/usr/bin/python3", args: ["-c", pyScript], timeout: 1.8),
+               status == 0 {
+                struct PyDev: Codable { let udid: String; let isNetwork: Bool }
+                if let items = try? JSONDecoder().decode([PyDev].self, from: pyData) {
+                    for it in items {
+                        rawResult.append((it.udid, it.isNetwork))
+                    }
                 }
             }
         }
@@ -2088,6 +2174,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     @Published var isRefreshing = false
     @Published var showHistoryModal = false
     @Published var showSettings = false
+    @Published var activeAlertBanner: String? = nil
     @Published var backgroundOpacity: Double = 0.48 {
         didSet {
             UserDefaults.standard.set(backgroundOpacity, forKey: "batteryWidget.bgOpacity")
@@ -2111,6 +2198,16 @@ final class BatteryWidgetViewModel: ObservableObject {
 
     func resetZoom() {
         widgetScale = 1.0
+    }
+    @Published var audioVolume: Double = 0.50 {
+        didSet {
+            UserDefaults.standard.set(audioVolume, forKey: "ibw.audioVolume")
+        }
+    }
+    @Published var overrideSystemVolume: Bool = true {
+        didSet {
+            UserDefaults.standard.set(overrideSystemVolume, forKey: "ibw.overrideSystemVolume")
+        }
     }
     @Published var pdSoundEnabled: Bool = true {
         didSet {
@@ -2177,7 +2274,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var lastPDHandshakeOn: Bool?
     private var pdAlertArmed = false
     private var pdDisconnectPending: Date? = nil
-    private var pdDebounceInterval: TimeInterval = 0.5
+    private var pdDebounceInterval: TimeInterval = 30.0
     private var lastPDAlertAt: Date = .distantPast
     private var pdHintSound: NSSound?
     private var lastIPhoneConnected: Bool? = nil
@@ -2204,21 +2301,28 @@ final class BatteryWidgetViewModel: ObservableObject {
         loadPersisted()
         // Always default to "all" view on startup as requested
         selectedDeviceId = "all"
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
         refresh()
         refreshLidSessions()
         startTimer()
+        startFastConnectionWatcher()
         AppUpdateChecker.shared.checkSoon()
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 self?.timer?.invalidate()
                 self?.timer = nil
+                self?.connectionWatcherTimer?.invalidate()
+                self?.connectionWatcherTimer = nil
                 self?.refreshLidSessions()
             }
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
+                self?.lastKnownWiredUDIDs = nil
+                self?.lastKnownAllUDIDs = nil
                 self?.startTimer()
+                self?.startFastConnectionWatcher()
                 self?.refresh(manual: false)
                 self?.refreshLidSessions()
             }
@@ -2333,6 +2437,16 @@ final class BatteryWidgetViewModel: ObservableObject {
             self.widgetScale = max(0.70, min(1.50, sc))
         } else {
             self.widgetScale = 1.0
+        }
+        if UserDefaults.standard.object(forKey: "ibw.audioVolume") != nil {
+            audioVolume = max(0.05, min(1.0, UserDefaults.standard.double(forKey: "ibw.audioVolume")))
+        } else {
+            audioVolume = 0.50
+        }
+        if UserDefaults.standard.object(forKey: "ibw.overrideSystemVolume") != nil {
+            overrideSystemVolume = UserDefaults.standard.bool(forKey: "ibw.overrideSystemVolume")
+        } else {
+            overrideSystemVolume = true
         }
         if UserDefaults.standard.object(forKey: "ibw.pdHandshakeSound") != nil {
             pdSoundEnabled = UserDefaults.standard.bool(forKey: "ibw.pdHandshakeSound")
@@ -2452,8 +2566,9 @@ final class BatteryWidgetViewModel: ObservableObject {
         let shouldFetchIOS = manual || Date().timeIntervalSince(lastIOSFetchAt) >= kIOSPollInterval
         if shouldFetchIOS && !isIOSBusy {
             isIOSBusy = true
-            Task.detached(priority: .utility) { [weak self] in
+            Task.detached(priority: .userInitiated) { [weak self] in
                 let connectedUDIDs = iDeviceReader.listConnectedUDIDs()
+                
                 var list: [DeviceBatteryData] = []
                 for (udid, isNet) in connectedUDIDs {
                     if let dev = iDeviceReader.fetchDevice(udid: udid, isNetwork: isNet) {
@@ -2468,10 +2583,6 @@ final class BatteryWidgetViewModel: ObservableObject {
                     self.lastIOSDevices = fetchedList
                     self.isIOSBusy = false
                     if manual { self.isRefreshing = false }
-                    
-                    let isPhoneConnectedNow = fetchedList.contains(where: { $0.deviceType != .mac && $0.isConnected && !$0.isWirelesslyConnected })
-                        && connectedUDIDs.contains(where: { !$0.0.contains("local") && !$0.0.contains("26cc71869") && !$0.1 })
-                    self.considerIPhoneConnectionSound(connected: isPhoneConnectedNow)
                     
                     self.rebuildDevicesList()
                 }
@@ -2841,65 +2952,163 @@ final class BatteryWidgetViewModel: ObservableObject {
 
         if let previousPD = lastPDHandshakeOn {
             if previousPD && !currentPD {
-                // Potential disconnect: start debounce timer
+                // Potential disconnect: start 30s debounce timer
                 if pdDisconnectPending == nil {
                     pdDisconnectPending = Date()
                 }
             } else if currentPD {
+                // Reconnected within 30s: cancel disconnect chime
                 pdDisconnectPending = nil
+                lastPDHandshakeOn = true
             }
         }
 
         if let pending = pdDisconnectPending, !currentPD {
             if Date().timeIntervalSince(pending) >= pdDebounceInterval {
                 playPDSound()
+                showPDDisconnectNotification()
                 pdDisconnectPending = nil
                 lastPDHandshakeOn = false
             }
-        } else {
+        } else if lastPDHandshakeOn == nil {
             lastPDHandshakeOn = currentPD
         }
     }
 
-    func playPDSound(named soundName: String? = nil, volume: Float = 0.80) {
+    func showPDDisconnectNotification() {
+        WidgetNotificationManager.shared.post(
+            title: "⚡️ USB-C Charger Disconnected",
+            body: "Power adapter has been disconnected for more than 30 seconds."
+        )
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            activeAlertBanner = "⚡️ USB-C Charger Disconnected (> 30s)"
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
+            withAnimation(.easeInOut(duration: 0.3)) {
+                if self?.activeAlertBanner?.contains("Charger Disconnected") == true {
+                    self?.activeAlertBanner = nil
+                }
+            }
+        }
+    }
+
+    func playPDSound(named soundName: String? = nil, volume: Float? = nil) {
         if soundName == nil && Date().timeIntervalSince(lastPDAlertAt) < 2.0 { return }
         if soundName == nil { lastPDAlertAt = Date() }
         let theme = soundName ?? pdSoundTheme
         let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
-        panPlayer.playLeftToRight(named: resolved, volume: volume)
+        let vol = volume ?? Float(self.audioVolume)
+        if overrideSystemVolume {
+            AudioSystemEngine.shared.playWithFixedVolume(level: vol, duration: 1.2) {
+                self.panPlayer.playLeftToRight(named: resolved, volume: 1.0)
+            }
+        } else {
+            panPlayer.playLeftToRight(named: resolved, volume: vol)
+        }
     }
 
-    private func considerIPhoneConnectionSound(connected: Bool) {
-        if let previous = lastIPhoneConnected {
-            if !previous && connected && iphoneSoundEnabled {
-                // iPhone plugged in / connected via wire
-                playIPhoneSound()
-            } else if previous && !connected && iphoneDisconnectSoundEnabled {
-                // iPhone unplugged / disconnected
-                playIPhoneDisconnectSound()
+    private var connectionWatcherTimer: Timer?
+    private var lastKnownWiredUDIDs: Set<String>? = nil
+    private var lastKnownAllUDIDs: Set<String>? = nil
+    private var usbHardwareDetector: USBPortDetector?
+
+    private func startFastConnectionWatcher() {
+        // 1. Hardware-level instant IOKit USB matching (< 5ms notification on plug/unplug)
+        if usbHardwareDetector == nil {
+            let detector = USBPortDetector { [weak self] _ in
+                Task.detached(priority: .userInitiated) {
+                    let currentUDIDs = iDeviceReader.listConnectedUDIDs()
+                    let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") && !$0.udid.contains("26cc71869") }.map { $0.udid })
+                    let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") && !$0.udid.contains("26cc71869") }.map { $0.udid })
+
+                    await MainActor.run { [weak self] in
+                        self?.checkConnectionTransitions(wired: currentWired, all: currentAll)
+                    }
+                }
+            }
+            detector.start()
+            self.usbHardwareDetector = detector
+        }
+
+        // 2. High-frequency polling backup for network/Wi-Fi devices and usbmux state
+        connectionWatcherTimer?.invalidate()
+        let t = Timer(timeInterval: 0.20, repeats: true) { [weak self] _ in
+            Task.detached(priority: .userInitiated) {
+                let currentUDIDs = iDeviceReader.listConnectedUDIDs()
+                let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") && !$0.udid.contains("26cc71869") }.map { $0.udid })
+                let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") && !$0.udid.contains("26cc71869") }.map { $0.udid })
+
+                await MainActor.run { [weak self] in
+                    self?.checkConnectionTransitions(wired: currentWired, all: currentAll)
+                }
             }
         }
-        lastIPhoneConnected = connected
+        RunLoop.main.add(t, forMode: .common)
+        connectionWatcherTimer = t
     }
 
-    func playIPhoneSound(named soundName: String? = nil, volume: Float = 0.85) {
-        if soundName == nil && Date().timeIntervalSince(lastIPhoneSoundAt) < 2.0 { return }
-        if soundName == nil { lastIPhoneSoundAt = Date() }
+    func checkConnectionTransitions(wired: Set<String>, all: Set<String>) {
+        guard let prevWired = lastKnownWiredUDIDs, let prevAll = lastKnownAllUDIDs else {
+            // First run on startup: initialize baseline without playing chime
+            lastKnownWiredUDIDs = wired
+            lastKnownAllUDIDs = all
+            return
+        }
+
+        let newlyWired = wired.subtracting(prevWired)
+        let unWired = prevWired.subtracting(wired)
+        let newlyConnected = all.subtracting(prevAll)
+        let disconnected = prevAll.subtracting(all)
+
+        lastKnownWiredUDIDs = wired
+        lastKnownAllUDIDs = all
+
+        // 1. Phone plugged in via cable OR newly connected
+        if !newlyWired.isEmpty || !newlyConnected.isEmpty {
+            if iphoneSoundEnabled {
+                playIPhoneSound()
+            }
+            refresh(manual: true)
+        }
+        // 2. Phone unplugged from cable or completely disconnected
+        else if !unWired.isEmpty || !disconnected.isEmpty {
+            if iphoneDisconnectSoundEnabled {
+                playIPhoneDisconnectSound()
+            }
+            refresh(manual: true)
+        }
+    }
+
+    func playIPhoneSound(named soundName: String? = nil, volume: Float? = nil) {
+        let now = Date()
+        if soundName == nil && now.timeIntervalSince(lastIPhoneSoundAt) < 3.0 { return }
+        if soundName == nil { lastIPhoneSoundAt = now }
         let theme = soundName ?? iphoneConnectSoundTheme
         let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
-        let sound = NSSound(named: NSSound.Name(resolved)) ?? NSSound(named: NSSound.Name("Pop"))
-        sound?.volume = volume
-        sound?.play()
+        let vol = volume ?? Float(self.audioVolume)
+        if overrideSystemVolume {
+            AudioSystemEngine.shared.playWithFixedVolume(level: vol, duration: 0.8) {
+                WidgetSoundPlayer.shared.playSound(named: resolved, fallback: "Pop", volume: 1.0)
+            }
+        } else {
+            WidgetSoundPlayer.shared.playSound(named: resolved, fallback: "Pop", volume: vol)
+        }
     }
 
-    func playIPhoneDisconnectSound(named soundName: String? = nil, volume: Float = 0.80) {
-        if soundName == nil && Date().timeIntervalSince(lastIPhoneDisconnectSoundAt) < 2.0 { return }
-        if soundName == nil { lastIPhoneDisconnectSoundAt = Date() }
+    func playIPhoneDisconnectSound(named soundName: String? = nil, volume: Float? = nil) {
+        let now = Date()
+        if soundName == nil && now.timeIntervalSince(lastIPhoneDisconnectSoundAt) < 3.0 { return }
+        if soundName == nil { lastIPhoneDisconnectSoundAt = now }
         let theme = soundName ?? iphoneDisconnectSoundTheme
         let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
-        let sound = NSSound(named: NSSound.Name(resolved)) ?? NSSound(named: NSSound.Name("Blow"))
-        sound?.volume = volume
-        sound?.play()
+        let vol = volume ?? Float(self.audioVolume)
+        if overrideSystemVolume {
+            AudioSystemEngine.shared.playWithFixedVolume(level: vol, duration: 0.8) {
+                WidgetSoundPlayer.shared.playSound(named: resolved, fallback: "Blow", volume: 1.0)
+            }
+        } else {
+            WidgetSoundPlayer.shared.playSound(named: resolved, fallback: "Blow", volume: vol)
+        }
     }
 
     private func consider80PercentChargeDing(devices: [DeviceBatteryData]) {
@@ -2929,12 +3138,17 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
-    func play80PercentDingSound(theme: String? = nil) {
+    func play80PercentDingSound(theme: String? = nil, volume: Float? = nil) {
         let selectedTheme = theme ?? eightyPercentSoundTheme
         let resolved = selectedTheme.prefix(1).uppercased() + selectedTheme.dropFirst().lowercased()
-        let sound = NSSound(named: NSSound.Name(resolved)) ?? NSSound(named: NSSound.Name("Glass"))
-        sound?.volume = 0.80
-        sound?.play()
+        let vol = volume ?? Float(self.audioVolume)
+        if overrideSystemVolume {
+            AudioSystemEngine.shared.playWithFixedVolume(level: vol, duration: 0.8) {
+                WidgetSoundPlayer.shared.playSound(named: resolved, fallback: "Glass", volume: 1.0)
+            }
+        } else {
+            WidgetSoundPlayer.shared.playSound(named: resolved, fallback: "Glass", volume: vol)
+        }
     }
 
     private func startTimer() {
@@ -2946,7 +3160,309 @@ final class BatteryWidgetViewModel: ObservableObject {
         timer = t
     }
 
-    deinit { timer?.invalidate() }
+    deinit {
+        timer?.invalidate()
+        connectionWatcherTimer?.invalidate()
+    }
+}
+
+// MARK: - Hardware Level USB Port Instant Event Detector (< 5ms notification)
+
+enum USBDeviceEvent {
+    case connected
+    case disconnected
+}
+
+final class USBPortDetector {
+    private var notifyPort: IONotificationPortRef?
+    private var addedIter: io_iterator_t = 0
+    private var removedIter: io_iterator_t = 0
+    private var onEvent: (USBDeviceEvent) -> Void
+    private var isInitialized = false
+
+    init(onEvent: @escaping (USBDeviceEvent) -> Void) {
+        self.onEvent = onEvent
+    }
+
+    func start() {
+        notifyPort = IONotificationPortCreate(kIOMainPortDefault)
+        guard let notifyPort = notifyPort else { return }
+        let runLoopSource = IONotificationPortGetRunLoopSource(notifyPort).takeRetainedValue()
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
+
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        let matchingAdded = IOServiceMatching("IOUSBDevice") as NSMutableDictionary
+        let matchingRemoved = matchingAdded.mutableCopy() as! NSMutableDictionary
+
+        let onMatched: IOServiceMatchingCallback = { (userData, iterator) in
+            guard let ptr = userData else { return }
+            let detector = Unmanaged<USBPortDetector>.fromOpaque(ptr).takeUnretainedValue()
+            var didMatch = false
+            while case let obj = IOIteratorNext(iterator), obj != 0 {
+                var nameBuf = [CChar](repeating: 0, count: 128)
+                IORegistryEntryGetName(obj, &nameBuf)
+                let name = String(cString: nameBuf)
+                if detector.isAppleMobileDevice(name: name) {
+                    didMatch = true
+                }
+                IOObjectRelease(obj)
+            }
+            if didMatch && detector.isInitialized {
+                detector.onEvent(.connected)
+            }
+        }
+
+        let onTerminated: IOServiceMatchingCallback = { (userData, iterator) in
+            guard let ptr = userData else { return }
+            let detector = Unmanaged<USBPortDetector>.fromOpaque(ptr).takeUnretainedValue()
+            var didMatch = false
+            while case let obj = IOIteratorNext(iterator), obj != 0 {
+                var nameBuf = [CChar](repeating: 0, count: 128)
+                IORegistryEntryGetName(obj, &nameBuf)
+                let name = String(cString: nameBuf)
+                if detector.isAppleMobileDevice(name: name) {
+                    didMatch = true
+                }
+                IOObjectRelease(obj)
+            }
+            if didMatch && detector.isInitialized {
+                detector.onEvent(.disconnected)
+            }
+        }
+
+        IOServiceAddMatchingNotification(notifyPort, kIOFirstMatchNotification, matchingAdded, onMatched, selfPtr, &addedIter)
+        while case let obj = IOIteratorNext(addedIter), obj != 0 {
+            IOObjectRelease(obj)
+        }
+
+        IOServiceAddMatchingNotification(notifyPort, kIOTerminatedNotification, matchingRemoved, onTerminated, selfPtr, &removedIter)
+        while case let obj = IOIteratorNext(removedIter), obj != 0 {
+            IOObjectRelease(obj)
+        }
+
+        isInitialized = true
+    }
+
+    private func isAppleMobileDevice(name: String) -> Bool {
+        let lower = name.lowercased()
+        return lower.contains("iphone") || lower.contains("ipad") || lower.contains("ipod") || lower.contains("apple mobile device")
+    }
+
+    deinit {
+        if addedIter != 0 { IOObjectRelease(addedIter) }
+        if removedIter != 0 { IOObjectRelease(removedIter) }
+        if let np = notifyPort { IONotificationPortDestroy(np) }
+    }
+}
+
+// MARK: - CoreAudio Volume Engine (Hardware Level Guaranteed Volume Override)
+
+final class AudioSystemEngine {
+    static let shared = AudioSystemEngine()
+    private var originalVolume: Float? = nil
+    private var originalMute: Bool? = nil
+    private var restoreWorkItem: DispatchWorkItem?
+
+    private func getDefaultOutputDevice() -> AudioDeviceID? {
+        var defaultOutputDeviceID = AudioDeviceID(0)
+        var propertyAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &propertyAddress,
+            0,
+            nil,
+            &dataSize,
+            &defaultOutputDeviceID
+        )
+        return status == noErr ? defaultOutputDeviceID : nil
+    }
+
+    func getMasterVolume() -> Float? {
+        guard let deviceID = getDefaultOutputDevice() else { return nil }
+        var volume: Float32 = 0
+        var volSize = UInt32(MemoryLayout<Float32>.size)
+        var volAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(deviceID, &volAddress, 0, nil, &volSize, &volume)
+        return status == noErr ? volume : nil
+    }
+
+    func setMasterVolume(_ vol: Float) {
+        guard let deviceID = getDefaultOutputDevice() else { return }
+        var newVol: Float32 = max(0.0, min(1.0, vol))
+        let volSize = UInt32(MemoryLayout<Float32>.size)
+        var volAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectSetPropertyData(deviceID, &volAddress, 0, nil, volSize, &newVol)
+    }
+
+    func isMuted() -> Bool {
+        guard let deviceID = getDefaultOutputDevice() else { return false }
+        var mute: UInt32 = 0
+        var muteSize = UInt32(MemoryLayout<UInt32>.size)
+        var muteAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectGetPropertyData(deviceID, &muteAddress, 0, nil, &muteSize, &mute)
+        return status == noErr && mute == 1
+    }
+
+    func setMuted(_ muted: Bool) {
+        guard let deviceID = getDefaultOutputDevice() else { return }
+        var mute: UInt32 = muted ? 1 : 0
+        let muteSize = UInt32(MemoryLayout<UInt32>.size)
+        var muteAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectSetPropertyData(deviceID, &muteAddress, 0, nil, muteSize, &mute)
+    }
+
+    func playWithFixedVolume(level: Float = 0.5, duration: TimeInterval = 0.8, action: () -> Void) {
+        restoreWorkItem?.cancel()
+        restoreWorkItem = nil
+
+        let currentVol = getMasterVolume() ?? 0.5
+        let currentMute = isMuted()
+
+        if originalVolume == nil {
+            originalVolume = currentVol
+        }
+        if originalMute == nil {
+            originalMute = currentMute
+        }
+
+        if currentMute {
+            setMuted(false)
+        }
+        setMasterVolume(level)
+
+        action()
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if let orig = self.originalVolume {
+                self.setMasterVolume(orig)
+            }
+            if let origMute = self.originalMute, origMute {
+                self.setMuted(true)
+            }
+            self.originalVolume = nil
+            self.originalMute = nil
+            self.restoreWorkItem = nil
+        }
+        self.restoreWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: item)
+    }
+}
+
+// MARK: - Robust System Sound & Chime Player
+
+final class WidgetSoundPlayer {
+    static let shared = WidgetSoundPlayer()
+    private var activePlayers: [AVAudioPlayer] = []
+
+    func playSound(named soundName: String, fallback: String = "Pop", volume: Float = 0.5) {
+        let soundCandidates: [URL]
+        let lower = soundName.lowercased()
+        if lower == "chime" || lower == "powerchime" || lower.contains("official") {
+            soundCandidates = [
+                URL(fileURLWithPath: "/System/Library/CoreServices/PowerChime.app/Contents/Resources/connect_power.aif"),
+                URL(fileURLWithPath: "/System/Library/Sounds/Glass.aiff")
+            ]
+        } else {
+            soundCandidates = [
+                URL(fileURLWithPath: "/System/Library/Sounds/\(soundName).aiff"),
+                URL(fileURLWithPath: "/System/Library/Sounds/\(fallback).aiff"),
+                URL(fileURLWithPath: "/System/Library/CoreServices/PowerChime.app/Contents/Resources/connect_power.aif")
+            ]
+        }
+        
+        for url in soundCandidates {
+            if FileManager.default.fileExists(atPath: url.path),
+               let player = try? AVAudioPlayer(contentsOf: url) {
+                player.volume = volume
+                player.prepareToPlay()
+                player.play()
+                
+                activePlayers.append(player)
+                DispatchQueue.main.asyncAfter(deadline: .now() + max(1.0, player.duration + 0.2)) { [weak self] in
+                    self?.activePlayers.removeAll(where: { !$0.isPlaying })
+                }
+                return
+            }
+        }
+        
+        let nsFallback = NSSound(named: NSSound.Name(soundName)) ?? NSSound(named: NSSound.Name(fallback))
+        nsFallback?.volume = volume
+        nsFallback?.play()
+    }
+}
+
+// MARK: - Dedicated System Notification Manager
+
+final class WidgetNotificationManager: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = WidgetNotificationManager()
+
+    override init() {
+        super.init()
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        if #available(macOS 11.0, *) {
+            completionHandler([.banner, .badge, .sound, .list])
+        } else {
+            completionHandler([.alert, .badge, .sound])
+        }
+    }
+
+    func post(title: String, body: String) {
+        // 1. Primary: UNUserNotificationCenter with active willPresent banner delegate
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .none
+        
+        let req = UNNotificationRequest(identifier: "ibw.notif.\(UUID().uuidString)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req) { error in
+            if error != nil {
+                Self.deliverViaAppleScript(title: title, body: body)
+            }
+        }
+        
+        // 2. Guaranteed native notification banner presentation via osascript
+        Self.deliverViaAppleScript(title: title, body: body)
+    }
+
+    static func deliverViaAppleScript(title: String, body: String) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let escapedTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+            let escapedBody = body.replacingOccurrences(of: "\"", with: "\\\"")
+            let script = "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""
+            var error: NSDictionary?
+            if let appleScript = NSAppleScript(source: script) {
+                appleScript.executeAndReturnError(&error)
+            }
+        }
+    }
 }
 
 // MARK: - Stereo Pan Audio Player (Left-to-Right Speaker Sweep)
@@ -2957,7 +3473,7 @@ final class PanAudioPlayer: NSObject, AVAudioPlayerDelegate {
     private var startTime: TimeInterval = 0
     private var duration: TimeInterval = 0
 
-    func playLeftToRight(named soundName: String, volume: Float = 0.85) {
+    func playLeftToRight(named soundName: String, volume: Float = 0.5) {
         let url = URL(fileURLWithPath: "/System/Library/Sounds/\(soundName).aiff")
         guard FileManager.default.fileExists(atPath: url.path),
               let p = try? AVAudioPlayer(contentsOf: url) else {
@@ -6254,6 +6770,56 @@ struct BatteryHistoryChartView: View {
                 Spacer()
             }
 
+            // Dedicated Alert Volume & Override Master Slider
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Alert Chime Volume")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Fixed independent volume for all connect/disconnect/80% alerts")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    Text("\(Int(vm.audioVolume * 100))%")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(Color(hex: "#30D158"))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+
+                HStack(spacing: 8) {
+                    Image(systemName: "speaker.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.4))
+                    Slider(value: $vm.audioVolume, in: 0.10...1.0, step: 0.05)
+                        .accentColor(Color(hex: "#30D158"))
+                    Image(systemName: "speaker.wave.3.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+
+                HStack {
+                    Text("Always play at this volume (ignores Mac mute/low volume)")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.6))
+                    Spacer()
+                    Toggle("", isOn: $vm.overrideSystemVolume)
+                        .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
+                        .labelsHidden()
+                }
+                .padding(.top, 2)
+            }
+            .padding(10)
+            .background(Color.white.opacity(0.03))
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.white.opacity(0.06), lineWidth: 1))
+
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+
             // 1. 80% Charge Limit Ding (iPhone Only)
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
@@ -6358,6 +6924,10 @@ struct BatteryHistoryChartView: View {
                             Text("Sound:")
                                 .font(.system(size: 9.5, weight: .semibold))
                                 .foregroundColor(.white.opacity(0.5))
+                            audioOptionPill(title: "Chime (Official)", id: "chime", current: vm.iphoneConnectSoundTheme) {
+                                vm.iphoneConnectSoundTheme = "chime"
+                                vm.playIPhoneSound(named: "Chime")
+                            }
                             audioOptionPill(title: "Pop", id: "pop", current: vm.iphoneConnectSoundTheme) {
                                 vm.iphoneConnectSoundTheme = "pop"
                                 vm.playIPhoneSound(named: "Pop")
@@ -6479,13 +7049,14 @@ struct BatteryHistoryChartView: View {
                         Text("USB-PD Disconnect Chime")
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundColor(.white.opacity(0.9))
-                        Text("Stereo left-to-right panning audio when high-speed charger unplugged")
+                        Text("Stereo left-to-right panning audio when charger remains unplugged for > 30s")
                             .font(.system(size: 10))
                             .foregroundColor(.white.opacity(0.5))
                     }
                     Spacer()
                     testAudioButton {
                         vm.playPDSound()
+                        vm.showPDDisconnectNotification()
                     }
                     Toggle("", isOn: $vm.pdSoundEnabled)
                         .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
@@ -7585,6 +8156,34 @@ struct BatteryWidgetView: View {
                 
                 Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
                     .padding(.horizontal, 10).padding(.vertical, 8)
+
+                if let alert = vm.activeAlertBanner {
+                    HStack(spacing: 6) {
+                        Image(systemName: "bolt.trianglebadge.exclamationmark.fill")
+                            .foregroundColor(Color(hex: "#FF9F0A"))
+                            .font(.system(size: 11, weight: .bold))
+                        Text(alert)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.white)
+                        Spacer()
+                        Button(action: {
+                            withAnimation { vm.activeAlertBanner = nil }
+                        }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.white.opacity(0.4))
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color(hex: "#FF9F0A").opacity(0.18))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color(hex: "#FF9F0A").opacity(0.4), lineWidth: 1))
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 6)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
 
                 if vm.selectedDeviceId == "all" {
                     VStack(spacing: 8) {
