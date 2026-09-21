@@ -21,12 +21,12 @@ A lightweight, translucent floating macOS desktop widget and comprehensive batte
 
 ## 📥 Download
 
-Latest release: **[v1.0.6](https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest)**
+Latest release: **[v1.0.7](https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest)**
 
 | Platform | Format | Size | Download Link |
 | :--- | :--- | :--- | :--- |
-| 🍏 **macOS (Apple Silicon)** | `.dmg` Installer | — | **[⬇️ Download iPhoneBatteryWidget-Installer.dmg](https://github.com/LondonVista/iPhoneBatteryWidget/releases/download/v1.0.6/iPhoneBatteryWidget-Installer.dmg)** |
-| 🍏 **macOS (Apple Silicon)** | `.app` zip | — | **[⬇️ Download iPhoneBatteryWidget.app.zip](https://github.com/LondonVista/iPhoneBatteryWidget/releases/download/v1.0.6/iPhoneBatteryWidget.app.zip)** |
+| 🍏 **macOS (Apple Silicon)** | `.dmg` Installer | — | **[⬇️ Download iPhoneBatteryWidget-Installer.dmg](https://github.com/LondonVista/iPhoneBatteryWidget/releases/download/v1.0.7/iPhoneBatteryWidget-Installer.dmg)** |
+| 🍏 **macOS (Apple Silicon)** | `.app` zip | — | **[⬇️ Download iPhoneBatteryWidget.app.zip](https://github.com/LondonVista/iPhoneBatteryWidget/releases/download/v1.0.7/iPhoneBatteryWidget.app.zip)** |
 
 ---
 

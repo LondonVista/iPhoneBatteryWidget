@@ -12,7 +12,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.6"
+    static let appVersion = "1.0.7"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -3010,10 +3010,11 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var connectionWatcherTimer: Timer?
     private var lastKnownWiredUDIDs: Set<String>? = nil
     private var lastKnownAllUDIDs: Set<String>? = nil
+    private var missingUDIDCounts: [String: Int] = [:]
     private var usbHardwareDetector: USBPortDetector?
 
     private func startFastConnectionWatcher() {
-        // 1. Hardware-level instant IOKit USB matching (< 5ms notification on plug/unplug)
+        // 1. Hardware-level instant IOKit USB matching (< 5ms notification on physical plug/unplug)
         if usbHardwareDetector == nil {
             let detector = USBPortDetector { [weak self] _ in
                 Task.detached(priority: .userInitiated) {
@@ -3022,7 +3023,7 @@ final class BatteryWidgetViewModel: ObservableObject {
                     let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") && !$0.udid.contains("26cc71869") }.map { $0.udid })
 
                     await MainActor.run { [weak self] in
-                        self?.checkConnectionTransitions(wired: currentWired, all: currentAll)
+                        self?.checkConnectionTransitions(wired: currentWired, all: currentAll, isHardwareEvent: true)
                     }
                 }
             }
@@ -3030,16 +3031,16 @@ final class BatteryWidgetViewModel: ObservableObject {
             self.usbHardwareDetector = detector
         }
 
-        // 2. High-frequency polling backup for network/Wi-Fi devices and usbmux state
+        // 2. Regular polling backup for network/Wi-Fi devices and usbmux state (1.5s interval with debounce hysteresis)
         connectionWatcherTimer?.invalidate()
-        let t = Timer(timeInterval: 0.20, repeats: true) { [weak self] _ in
-            Task.detached(priority: .userInitiated) {
+        let t = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
+            Task.detached(priority: .utility) {
                 let currentUDIDs = iDeviceReader.listConnectedUDIDs()
                 let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") && !$0.udid.contains("26cc71869") }.map { $0.udid })
                 let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") && !$0.udid.contains("26cc71869") }.map { $0.udid })
 
                 await MainActor.run { [weak self] in
-                    self?.checkConnectionTransitions(wired: currentWired, all: currentAll)
+                    self?.checkConnectionTransitions(wired: currentWired, all: currentAll, isHardwareEvent: false)
                 }
             }
         }
@@ -3047,7 +3048,7 @@ final class BatteryWidgetViewModel: ObservableObject {
         connectionWatcherTimer = t
     }
 
-    func checkConnectionTransitions(wired: Set<String>, all: Set<String>) {
+    func checkConnectionTransitions(wired: Set<String>, all: Set<String>, isHardwareEvent: Bool = false) {
         guard let prevWired = lastKnownWiredUDIDs, let prevAll = lastKnownAllUDIDs else {
             // First run on startup: initialize baseline without playing chime
             lastKnownWiredUDIDs = wired
@@ -3055,33 +3056,76 @@ final class BatteryWidgetViewModel: ObservableObject {
             return
         }
 
+        // Reset missing counters for any devices currently present
+        for udid in all {
+            missingUDIDCounts.removeValue(forKey: udid)
+            missingUDIDCounts.removeValue(forKey: "wired_" + udid)
+        }
+
+        var confirmedDisconnected = Set<String>()
+        var confirmedUnwired = Set<String>()
+
+        if isHardwareEvent {
+            // Physical hardware USB connect/disconnect is instant
+            confirmedUnwired = prevWired.subtracting(wired)
+            confirmedDisconnected = prevAll.subtracting(all)
+        } else {
+            // Network/polling state: require 2 consecutive missing cycles (~3.0s) to confirm disconnect
+            let unconfirmedMissing = prevAll.subtracting(all)
+            for udid in unconfirmedMissing {
+                let count = (missingUDIDCounts[udid] ?? 0) + 1
+                missingUDIDCounts[udid] = count
+                if count >= 2 {
+                    confirmedDisconnected.insert(udid)
+                    if prevWired.contains(udid) && !wired.contains(udid) {
+                        confirmedUnwired.insert(udid)
+                    }
+                }
+            }
+
+            let unconfirmedUnwired = prevWired.subtracting(wired)
+            for udid in unconfirmedUnwired {
+                let count = (missingUDIDCounts["wired_" + udid] ?? 0) + 1
+                missingUDIDCounts["wired_" + udid] = count
+                if count >= 2 {
+                    confirmedUnwired.insert(udid)
+                }
+            }
+        }
+
         let newlyWired = wired.subtracting(prevWired)
-        let unWired = prevWired.subtracting(wired)
         let newlyConnected = all.subtracting(prevAll)
-        let disconnected = prevAll.subtracting(all)
 
-        lastKnownWiredUDIDs = wired
-        lastKnownAllUDIDs = all
+        if isHardwareEvent || !confirmedDisconnected.isEmpty || !confirmedUnwired.isEmpty || !newlyWired.isEmpty || !newlyConnected.isEmpty {
+            lastKnownWiredUDIDs = wired
+            lastKnownAllUDIDs = all
+        }
 
-        // 1. Phone plugged in via cable OR newly connected
-        if !newlyWired.isEmpty || !newlyConnected.isEmpty {
+        let now = Date()
+
+        // 1. Phone physically plugged in via cable
+        if !newlyWired.isEmpty && now.timeIntervalSince(lastIPhoneDisconnectSoundAt) >= 2.0 {
             if iphoneSoundEnabled {
                 playIPhoneSound()
             }
             refresh(manual: true)
         }
-        // 2. Phone unplugged from cable or completely disconnected
-        else if !unWired.isEmpty || !disconnected.isEmpty {
+        // 2. Phone physically unplugged from cable
+        else if !confirmedUnwired.isEmpty && now.timeIntervalSince(lastIPhoneSoundAt) >= 2.0 {
             if iphoneDisconnectSoundEnabled {
                 playIPhoneDisconnectSound()
             }
+            refresh(manual: true)
+        }
+        // 3. Wireless Wi-Fi connect/disconnect transitions: update telemetry silently without audio interruption
+        else if !newlyConnected.isEmpty || !confirmedDisconnected.isEmpty {
             refresh(manual: true)
         }
     }
 
     func playIPhoneSound(named soundName: String? = nil, volume: Float? = nil) {
         let now = Date()
-        if soundName == nil && now.timeIntervalSince(lastIPhoneSoundAt) < 3.0 { return }
+        if soundName == nil && (now.timeIntervalSince(lastIPhoneSoundAt) < 3.0 || now.timeIntervalSince(lastIPhoneDisconnectSoundAt) < 2.0) { return }
         if soundName == nil { lastIPhoneSoundAt = now }
         let theme = soundName ?? iphoneConnectSoundTheme
         let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
@@ -3097,7 +3141,7 @@ final class BatteryWidgetViewModel: ObservableObject {
 
     func playIPhoneDisconnectSound(named soundName: String? = nil, volume: Float? = nil) {
         let now = Date()
-        if soundName == nil && now.timeIntervalSince(lastIPhoneDisconnectSoundAt) < 3.0 { return }
+        if soundName == nil && (now.timeIntervalSince(lastIPhoneDisconnectSoundAt) < 3.0 || now.timeIntervalSince(lastIPhoneSoundAt) < 2.0) { return }
         if soundName == nil { lastIPhoneDisconnectSoundAt = now }
         let theme = soundName ?? iphoneDisconnectSoundTheme
         let resolved = theme.prefix(1).uppercased() + theme.dropFirst().lowercased()
