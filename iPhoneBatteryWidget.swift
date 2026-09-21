@@ -12,7 +12,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.5"
+    static let appVersion = "1.0.6"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -4884,20 +4884,29 @@ struct DailyTempTableRowView: View {
     }
 }
 
+@MainActor
+final class HistoryUIState: ObservableObject {
+    @Published var selectedDevId: String = ""
+    @Published var activeTab: BatteryHistoryChartView.HistTab = .graph
+    @Published var importError: String? = nil
+    @Published var exportSuccess: Bool = false
+    @Published var hoveredRowIndex: Int? = nil
+    @Published var showHealthGraph: Bool = true
+    @Published var showCyclesGraph: Bool = true
+    @Published var showCapacityGraph: Bool = true
+    @Published var aggregateDaily: Bool = true
+    @Published var sortAscending: Bool = false
+    @Published var compareWithOldiPhone: Bool = false
+    @Published var selectedTempSection: BatteryHistoryChartView.TempChartSection = .today
+    @Published var selectedCustomDateKey: String? = nil
+    @Published var selectedLidSection: BatteryHistoryChartView.LidSessionSection = .today
+}
+
+@MainActor
 struct BatteryHistoryChartView: View {
     @ObservedObject var vm: BatteryWidgetViewModel
     var onClose: (() -> Void)? = nil
-    @State private var selectedDevId: String
-    @State private var activeTab: HistTab = .graph
-    @State private var importError: String? = nil
-    @State private var exportSuccess: Bool = false
-    @State private var hoveredRowIndex: Int? = nil
-    @State private var showHealthGraph: Bool = true
-    @State private var showCyclesGraph: Bool = true
-    @State private var showCapacityGraph: Bool = true
-    @State private var aggregateDaily: Bool = true
-    @State private var sortAscending: Bool = false
-    @State private var compareWithOldiPhone: Bool = false
+    @StateObject private var ui = HistoryUIState()
     @Environment(\.dismiss) var dismiss
 
     enum HistTab: String, CaseIterable {
@@ -4927,21 +4936,20 @@ struct BatteryHistoryChartView: View {
         case all       = "All History"
     }
 
-    @State private var selectedTempSection: TempChartSection = .today
-    @State private var selectedCustomDateKey: String? = nil
-    @State private var selectedLidSection: LidSessionSection = .today
-
-    init(vm: BatteryWidgetViewModel, onClose: (() -> Void)? = nil) {
-        self.vm = vm
-        self.onClose = onClose
-        let initialId: String
-        if vm.selectedDeviceId == "all" {
-            initialId = vm.devices.first(where: { $0.deviceType == .mac })?.id ?? (vm.devices.first?.id ?? "local_mac")
-        } else {
-            initialId = vm.selectedDeviceId
-        }
-        _selectedDevId = State(initialValue: initialId)
-    }
+    private var selectedDevId: String { get { ui.selectedDevId } nonmutating set { ui.selectedDevId = newValue } }
+    private var activeTab: HistTab { get { ui.activeTab } nonmutating set { ui.activeTab = newValue } }
+    private var importError: String? { get { ui.importError } nonmutating set { ui.importError = newValue } }
+    private var exportSuccess: Bool { get { ui.exportSuccess } nonmutating set { ui.exportSuccess = newValue } }
+    private var hoveredRowIndex: Int? { get { ui.hoveredRowIndex } nonmutating set { ui.hoveredRowIndex = newValue } }
+    private var showHealthGraph: Bool { get { ui.showHealthGraph } nonmutating set { ui.showHealthGraph = newValue } }
+    private var showCyclesGraph: Bool { get { ui.showCyclesGraph } nonmutating set { ui.showCyclesGraph = newValue } }
+    private var showCapacityGraph: Bool { get { ui.showCapacityGraph } nonmutating set { ui.showCapacityGraph = newValue } }
+    private var aggregateDaily: Bool { get { ui.aggregateDaily } nonmutating set { ui.aggregateDaily = newValue } }
+    private var sortAscending: Bool { get { ui.sortAscending } nonmutating set { ui.sortAscending = newValue } }
+    private var compareWithOldiPhone: Bool { get { ui.compareWithOldiPhone } nonmutating set { ui.compareWithOldiPhone = newValue } }
+    private var selectedTempSection: TempChartSection { get { ui.selectedTempSection } nonmutating set { ui.selectedTempSection = newValue } }
+    private var selectedCustomDateKey: String? { get { ui.selectedCustomDateKey } nonmutating set { ui.selectedCustomDateKey = newValue } }
+    private var selectedLidSection: LidSessionSection { get { ui.selectedLidSection } nonmutating set { ui.selectedLidSection = newValue } }
 
     private var historyDevices: [DeviceBatteryData] {
         var list: [DeviceBatteryData] = []
@@ -5450,6 +5458,15 @@ struct BatteryHistoryChartView: View {
                     )
             }
         )
+        .onAppear {
+            if selectedDevId.isEmpty {
+                if vm.selectedDeviceId == "all" {
+                    selectedDevId = vm.devices.first(where: { $0.deviceType == .mac })?.id ?? (vm.devices.first?.id ?? "local_mac")
+                } else {
+                    selectedDevId = vm.selectedDeviceId
+                }
+            }
+        }
     }
 
     // MARK: - Modern Polished Data Table (Strict Grid Alignment, No Data Version Column)
@@ -7361,9 +7378,14 @@ struct VisualEffectBlurView: NSViewRepresentable {
     }
 }
 
+private final class DragState: ObservableObject {
+    var startMouse: NSPoint = .zero
+    var startOrigin: NSPoint = .zero
+}
+
+@MainActor
 struct WindowDragModifier: ViewModifier {
-    @State private var startMouse: NSPoint = .zero
-    @State private var startOrigin: NSPoint = .zero
+    @StateObject private var dragState = DragState()
 
     func body(content: Content) -> some View {
         content
@@ -7371,21 +7393,21 @@ struct WindowDragModifier: ViewModifier {
                 DragGesture(minimumDistance: 1, coordinateSpace: .global)
                     .onChanged { _ in
                         guard let window = NSApp.windows.first(where: { $0 is FloatingPanel }) else { return }
-                        if startMouse == .zero {
-                            startMouse = NSEvent.mouseLocation
-                            startOrigin = window.frame.origin
+                        if dragState.startMouse == .zero {
+                            dragState.startMouse = NSEvent.mouseLocation
+                            dragState.startOrigin = window.frame.origin
                         }
                         let cur = NSEvent.mouseLocation
-                        let dx = cur.x - startMouse.x
-                        let dy = cur.y - startMouse.y
+                        let dx = cur.x - dragState.startMouse.x
+                        let dy = cur.y - dragState.startMouse.y
                         
                         let screen = window.screen ?? NSScreen.main ?? NSScreen.screens.first
                         let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
                         let w = window.frame.width
                         let h = window.frame.height
                         
-                        let targetX = startOrigin.x + dx
-                        let targetY = startOrigin.y + dy
+                        let targetX = dragState.startOrigin.x + dx
+                        let targetY = dragState.startOrigin.y + dy
                         
                         // Prevent dragging window below bottom of screen / dock or beyond screen bounds
                         let clampedX = max(vis.minX + 4, min(vis.maxX - w - 4, targetX))
@@ -7394,8 +7416,8 @@ struct WindowDragModifier: ViewModifier {
                         window.setFrameOrigin(NSPoint(x: clampedX, y: clampedY))
                     }
                     .onEnded { _ in
-                        startMouse = .zero
-                        startOrigin = .zero
+                        dragState.startMouse = .zero
+                        dragState.startOrigin = .zero
                         if let window = NSApp.windows.first(where: { $0 is FloatingPanel }) {
                             UserDefaults.standard.set(window.frame.origin.x, forKey: kFrameOriginX)
                             UserDefaults.standard.set(window.frame.maxY, forKey: kFrameTopY)
@@ -7407,6 +7429,7 @@ struct WindowDragModifier: ViewModifier {
 
 // MARK: - Lid Sessions Popover View
 
+@MainActor
 struct LidSessionsPopoverView: View {
     @ObservedObject var vm: BatteryWidgetViewModel
 
@@ -7505,13 +7528,16 @@ struct LidSessionsPopoverView: View {
     }
 }
 
-// MARK: - Device Grid Card View for Overview
+private final class LidPopoverState: ObservableObject {
+    @Published var showing: Bool = false
+}
 
+@MainActor
 struct DeviceGridCardView: View {
     var vm: BatteryWidgetViewModel? = nil
     let dev: DeviceBatteryData
     let onSelect: () -> Void
-    @State private var showingLidSessions: Bool = false
+    @StateObject private var popoverState = LidPopoverState()
 
     private func healthColor(_ val: Double) -> Color {
         if val >= 90 { return Color(hex: "#30D158") }
@@ -7887,7 +7913,7 @@ struct DeviceGridCardView: View {
     private var lidOpenRow: some View {
         if (dev.deviceType == .mac || dev.deviceId == "local_mac"), let firstOpen = vm?.firstLidOpenToday {
             Button(action: {
-                showingLidSessions = true
+                popoverState.showing = true
             }) {
                 HStack {
                     HStack(spacing: 3.5) {
@@ -7911,7 +7937,7 @@ struct DeviceGridCardView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .popover(isPresented: $showingLidSessions, arrowEdge: .trailing) {
+            .popover(isPresented: $popoverState.showing, arrowEdge: .trailing) {
                 if let v = vm {
                     LidSessionsPopoverView(vm: v)
                 }
@@ -7994,10 +8020,10 @@ struct DeviceGridCardView: View {
 
 // MARK: - Main Battery Widget View
 
+@MainActor
 struct BatteryWidgetView: View {
     @ObservedObject var vm: BatteryWidgetViewModel
     var onOpenHistory: (() -> Void)? = nil
-    @State private var showingHistory: Bool = false
 
     private var device: DeviceBatteryData? {
         vm.selectedDevice
@@ -8114,11 +8140,7 @@ struct BatteryWidgetView: View {
                     
                     // Settings & Battery Archive button
                     Button(action: {
-                        if let openHist = onOpenHistory {
-                            openHist()
-                        } else {
-                            showingHistory = true
-                        }
+                        onOpenHistory?()
                     }) {
                         Image(systemName: "gearshape")
                             .font(.system(size: 10))
