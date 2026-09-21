@@ -21,14 +21,24 @@ fi
 SDK_FLAGS=()
 if [[ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" ]]; then
   SDK_FLAGS+=("-sdk" "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk")
+elif [[ -d "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk" ]]; then
+  SDK_FLAGS+=("-sdk" "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
 fi
 
 swiftc $OPT_FLAG -j 8 -parse-as-library \
   "${SDK_FLAGS[@]}" \
   -o "$BIN/iPhoneBatteryWidget" \
   "$ROOT/iPhoneBatteryWidget.swift" \
-  -framework Cocoa -framework SwiftUI \
-  -target arm64-apple-macos13
+  -framework Cocoa \
+  -framework SwiftUI \
+  -framework Metal \
+  -framework MetalKit \
+  -framework QuartzCore \
+  -framework AVFoundation \
+  -framework AudioToolbox \
+  -framework UserNotifications \
+  -framework IOKit \
+  -target arm64-apple-macos14
 
 chmod +x "$BIN/iPhoneBatteryWidget"
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
