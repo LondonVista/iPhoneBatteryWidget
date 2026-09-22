@@ -12,7 +12,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.7"
+    static let appVersion = "1.0.8"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -3486,25 +3486,20 @@ final class WidgetNotificationManager: NSObject, UNUserNotificationCenterDelegat
         content.sound = .none
         
         let req = UNNotificationRequest(identifier: "ibw.notif.\(UUID().uuidString)", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req) { error in
-            if error != nil {
-                Self.deliverViaAppleScript(title: title, body: body)
-            }
-        }
+        UNUserNotificationCenter.current().add(req) { _ in }
         
-        // 2. Guaranteed native notification banner presentation via osascript
+        // 2. Guaranteed notification banner presentation via isolated subprocess
         Self.deliverViaAppleScript(title: title, body: body)
     }
 
     static func deliverViaAppleScript(title: String, body: String) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let escapedTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
-            let escapedBody = body.replacingOccurrences(of: "\"", with: "\\\"")
-            let script = "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""
-            var error: NSDictionary?
-            if let appleScript = NSAppleScript(source: script) {
-                appleScript.executeAndReturnError(&error)
-            }
+        DispatchQueue.global(qos: .utility).async {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            let escapedTitle = title.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            let escapedBody = body.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            proc.arguments = ["-e", "display notification \"\(escapedBody)\" with title \"\(escapedTitle)\""]
+            try? proc.run()
         }
     }
 }
