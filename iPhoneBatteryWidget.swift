@@ -4,6 +4,7 @@ import AVFoundation
 import AudioToolbox
 import UserNotifications
 import Darwin
+import IOKit
 import IOKit.ps
 import CryptoKit
 import Compression
@@ -12,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.8"
+    static let appVersion = "1.0.10"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -163,7 +164,8 @@ private let kHistoryLogKey = "ibw.batteryHistoryLog.v2"
 private let kLidHistoryLogKey = "ibw.lidHistoryLog.v1"
 private let kSelectedTabKey = "ibw.selectedDeviceTab"
 private let kPollInterval: TimeInterval = 1.0
-private let kIOSPollInterval: TimeInterval = 1.0
+// Full iPhone lockdown is a Python process. Plug and unplug still refresh immediately.
+private let kIOSPollInterval: TimeInterval = 3.0
 
 // MARK: - Privacy & Standardized Device Name Resolver
 
@@ -626,186 +628,104 @@ enum MacBatteryReader {
     }
 
     private static var cached: StaticInfo?
-    private static var packTick = 0
     private static var lastTempC: Double?
 
-    private static func run(_ path: String, _ args: [String], timeout: TimeInterval = 1.5) -> String {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: path)
-        task.arguments = args
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do { try task.run() } catch { return "" }
-        let start = Date()
-        while task.isRunning && Date().timeIntervalSince(start) < timeout {
-            usleep(15_000)
+    private static func serviceProperties(_ className: String) -> [String: Any]? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(className))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        var cfProps: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &cfProps, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let props = cfProps?.takeRetainedValue() as? [String: Any] else { return nil }
+        return props
+    }
+
+    private static func asInt(_ any: Any?) -> Int? {
+        (any as? NSNumber)?.intValue
+    }
+
+    /// Pack current is a signed milliamp value, sometimes stored as uint64 two's complement.
+    private static func signedMilli(_ any: Any?) -> Int? {
+        guard let n = any as? NSNumber else { return nil }
+        if n.int64Value < 0 { return Int(n.int64Value) }
+        let u = n.uint64Value
+        if u > UInt64(Int64.max) { return Int(Int64(bitPattern: u)) }
+        return Int(u)
+    }
+
+    private static func asBool(_ any: Any?) -> Bool {
+        (any as? NSNumber)?.boolValue ?? false
+    }
+
+    private static func asString(_ any: Any?) -> String? {
+        any as? String
+    }
+
+    private static func asDict(_ any: Any?) -> [String: Any]? {
+        any as? [String: Any]
+    }
+
+    private static func firstInt(_ keys: [String], in dicts: [[String: Any]]) -> Int? {
+        for d in dicts {
+            for k in keys {
+                if let v = asInt(d[k]) { return v }
+            }
         }
-        if task.isRunning {
-            task.terminate()
-            return ""
-        }
-        guard task.terminationStatus == 0 else { return "" }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8) ?? ""
+        return nil
     }
 
     static func fetch() -> DeviceBatteryData {
-        // Depth 1 + unlimited width: AdapterDetails/PD without dumping every child cell + IOReport legend.
-        let text = run("/usr/sbin/ioreg", ["-r", "-c", "AppleSmartBattery", "-d", "1", "-w", "0"])
+        let batt = serviceProperties("AppleSmartBattery") ?? [:]
+        let battData = asDict(batt["BatteryData"]) ?? [:]
+        let packData = asDict(serviceProperties("AppleSmartBatteryPack")?["BatteryData"]) ?? [:]
+        let adapter = asDict(batt["AdapterDetails"]) ?? [:]
+        let telemetry = asDict(batt["PowerTelemetryData"]) ?? [:]
 
-        func regexInt(_ key: String) -> Int? {
-            let pattern = "\"\(key)\"\\s*=\\s*(-?\\d+)"
-            guard let re = try? NSRegularExpression(pattern: pattern),
-                  let m = re.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
-                  let r = Range(m.range(at: 1), in: text) else { return nil }
-            return Int(text[r])
-        }
+        let cycleCount = firstInt(["CycleCount"], in: [batt, battData, packData])
+        let voltage = firstInt(["AppleRawBatteryVoltage", "Voltage"], in: [batt, battData, packData])
+        let fullyCharged = asBool(batt["FullyCharged"]) || (asInt(battData["FullyCharged"]) ?? 0) != 0
 
-        func regexUInt64(_ key: String) -> UInt64? {
-            let pattern = "\"\(key)\"\\s*=\\s*(\\d+)"
-            guard let re = try? NSRegularExpression(pattern: pattern),
-                  let m = re.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
-                  let r = Range(m.range(at: 1), in: text) else { return nil }
-            return UInt64(text[r])
-        }
+        let fullCharge = firstInt(["AppleRawMaxCapacity", "FullChargeCapacity", "NominalChargeCapacity"], in: [batt, packData, battData])
+        let designCap = firstInt(["DesignCapacity", "DesignCapacityMah"], in: [batt, packData, battData])
+        let curCap = firstInt(["CurrentCapacity"], in: [batt, battData])
+        let remMah = firstInt(["AppleRawCurrentCapacity", "RemainingCapacity"], in: [batt, packData, battData])
 
-        func signedMilli(_ key: String) -> Int? {
-            guard let u = regexUInt64(key) else { return nil }
-            return Int(Int64(bitPattern: u))
-        }
-
-        func regexBool(_ key: String) -> Bool {
-            let pattern = "\"\(key)\"\\s*=\\s*(Yes|true|1)"
-            guard let re = try? NSRegularExpression(pattern: pattern),
-                  re.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)) != nil else { return false }
-            return true
-        }
-
-        func regexStr(_ key: String) -> String? {
-            let pattern = "\"\(key)\"\\s*=\\s*\"([^\"]+)\""
-            guard let re = try? NSRegularExpression(pattern: pattern),
-                  let m = re.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
-                  let r = Range(m.range(at: 1), in: text) else { return nil }
-            return String(text[r])
-        }
-
-        let cycleCount = regexInt("CycleCount")
-        let voltage = regexInt("AppleRawBatteryVoltage") ?? regexInt("Voltage")
-        let fullyCharged = regexBool("FullyCharged")
-        
-        // Extract BatteryData dictionary
-        var fullCharge = regexInt("AppleRawMaxCapacity") ?? regexInt("FullChargeCapacity") ?? regexInt("NominalChargeCapacity")
-        var designCap = regexInt("DesignCapacity") ?? regexInt("DesignCapacityMah")
-        var curCap = regexInt("CurrentCapacity")
-        var remMah = regexInt("AppleRawCurrentCapacity") ?? regexInt("RemainingCapacity")
-        
-        if fullCharge == nil || fullCharge == 0 {
-            // Check secondary pattern inside "BatteryData" = { ... }
-            if let bdRange = text.range(of: "\"BatteryData\"\\s*=\\s*\\{([^\\}]+)\\}", options: .regularExpression) {
-                let bdStr = String(text[bdRange])
-                func subInt(_ k: String) -> Int? {
-                    guard let re = try? NSRegularExpression(pattern: "\"\(k)\"=(\\d+)"),
-                          let m = re.firstMatch(in: bdStr, range: NSRange(location: 0, length: bdStr.utf16.count)),
-                          let r = Range(m.range(at: 1), in: bdStr) else { return nil }
-                    return Int(bdStr[r])
-                }
-                if fullCharge == nil { fullCharge = subInt("FullChargeCapacity") }
-                if designCap == nil { designCap = subInt("DesignCapacity") }
-                if curCap == nil { curCap = subInt("CurrentCapacity") }
-                if remMah == nil { remMah = subInt("RemainingCapacity") }
-            }
-        }
-        
         let fcc = fullCharge ?? 4241
         let dCap = designCap ?? 4382
         let rem = remMah ?? 2653
         let cInt = curCap ?? 66
-
         let exactPct = Double(cInt)
         let healthPct = dCap > 0 ? ((Double(fcc) / Double(dCap)) * 100.0) : 100.0
 
-        var signedAmperageMa: Int? = signedMilli("InstantAmperage") ?? signedMilli("Amperage")
-        var tempC: Double? = lastTempC
-        packTick += 1
-        if packTick == 1 || packTick % 3 == 0 {
-            let packText = run("/usr/sbin/ioreg", ["-r", "-n", "AppleSmartBatteryPack", "-d", "2"])
-            let patternT = "\"(?:Temperature|VirtualTemperature)\"\\s*=\\s*(\\d+)"
-            if let re = try? NSRegularExpression(pattern: patternT),
-               let m = re.firstMatch(in: packText, range: NSRange(location: 0, length: packText.utf16.count)),
-               let r = Range(m.range(at: 1), in: packText),
-               let rawT = Double(packText[r]) {
-                tempC = rawT > 100 ? (rawT / 100.0 * 10).rounded() / 10 : rawT
-                lastTempC = tempC
-            }
-            if signedAmperageMa == nil {
-                let patternA = "\"Amperage\"\\s*=\\s*(\\d+)"
-                if let reA = try? NSRegularExpression(pattern: patternA),
-                   let mA = reA.firstMatch(in: packText, range: NSRange(location: 0, length: packText.utf16.count)),
-                   let rA = Range(mA.range(at: 1), in: packText),
-                   let rawA = UInt64(packText[rA]) {
-                    signedAmperageMa = Int(Int64(bitPattern: rawA))
-                }
-            }
-        }
-        if tempC == nil {
-            let patternT = "\"(?:Temperature|VirtualTemperature)\"\\s*=\\s*(\\d+)"
-            if let re = try? NSRegularExpression(pattern: patternT),
-               let m = re.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
-               let r = Range(m.range(at: 1), in: text),
-               let rawT = Double(text[r]) {
-                tempC = rawT > 100 ? (rawT / 100.0 * 10).rounded() / 10 : rawT
-            }
+        let signedAmperageMa = signedMilli(batt["InstantAmperage"])
+            ?? signedMilli(batt["Amperage"])
+            ?? signedMilli(packData["InstantAmperage"])
+            ?? signedMilli(packData["Amperage"])
+
+        var tempC = lastTempC
+        if let rawT = asInt(packData["Temperature"]) ?? asInt(packData["VirtualTemperature"]) ?? asInt(battData["Temperature"]) {
+            let raw = Double(rawT)
+            tempC = raw > 100 ? (raw / 100.0 * 10).rounded() / 10 : raw
+            lastTempC = tempC
         }
 
-        func nestedInt(_ key: String) -> Int? {
-            let pattern = "\"\(key)\"\\s*=\\s*(-?\\d+)"
-            guard let re = try? NSRegularExpression(pattern: pattern),
-                  let m = re.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
-                  let r = Range(m.range(at: 1), in: text) else { return nil }
-            return Int(text[r])
-        }
-        let extChargeCapable = regexBool("ExternalChargeCapable")
-        let hasExternalYes = text.range(of: #"(?<!Fed)"ExternalConnected"\s*=\s*Yes"#, options: .regularExpression) != nil
-        let hasExternalNo = text.range(of: #"(?<!Fed)"ExternalConnected"\s*=\s*No"#, options: .regularExpression) != nil
-        let chargingFlag = regexBool("IsCharging")
+        let extChargeCapable = asBool(batt["ExternalChargeCapable"])
+        let externalConnected = asBool(batt["ExternalConnected"])
+        let chargingFlag = asBool(batt["IsCharging"])
         let amps = signedAmperageMa ?? 0
 
-        // Parse AdapterDetails block strictly
-        var adapterStr = ""
-        if let adRange = text.range(of: "\"AdapterDetails\"\\s*=\\s*\\{([^\\}]+)\\}", options: .regularExpression) {
-            adapterStr = String(text[adRange])
-        }
-        
-        func adapterInt(_ k: String) -> Int? {
-            guard !adapterStr.isEmpty else { return nil }
-            let pat = "\"\(k)\"\\s*=\\s*(-?\\d+)"
-            guard let re = try? NSRegularExpression(pattern: pat),
-                  let m = re.firstMatch(in: adapterStr, range: NSRange(location: 0, length: adapterStr.utf16.count)),
-                  let r = Range(m.range(at: 1), in: adapterStr) else { return nil }
-            return Int(adapterStr[r])
-        }
-        
-        let hvc = adapterInt("UsbHvcHvcIndex") ?? 0
-        let negotiatedmV = adapterInt("AdapterVoltage") ?? 0
-        let inputmV = adapterInt("SystemVoltageIn") ?? negotiatedmV
-        let detectedWatts = adapterInt("Watts")
+        let hvc = asInt(adapter["UsbHvcHvcIndex"]) ?? 0
+        let negotiatedmV = asInt(adapter["AdapterVoltage"]) ?? 0
+        let inputmV = negotiatedmV
+        let detectedWatts = asInt(adapter["Watts"])
         let inputV = Double(inputmV) / 1000.0
         let negotiatedV = Double(negotiatedmV) / 1000.0
         let detectedV = inputV > 1 ? inputV : (negotiatedV > 1 ? negotiatedV : nil)
 
-        // Real USB-PD fast charging contract (>5V or >=10W or negotiated high voltage contract)
         let isRealPDContract = extChargeCapable && ((detectedWatts ?? 0) >= 10 || (detectedV ?? 0) >= 8.5 || (1...3).contains(hvc))
 
         // AC power connection (strictly ignores 5V / 5W accessory connections like attached iPhone)
-        let isACConnected: Bool = {
-            if hasExternalNo { return false }
-            if !hasExternalYes { return false }
-            if extChargeCapable || chargingFlag || isRealPDContract {
-                return true
-            }
-            return false
-        }()
+        let isACConnected = externalConnected && (extChargeCapable || chargingFlag || isRealPDContract)
 
         // Trust IOKit's IsCharging bit, or any real positive pack current.
         let isCharging = isACConnected && (chargingFlag || amps > 30)
@@ -814,11 +734,12 @@ enum MacBatteryReader {
         if let v = voltage, signedAmperageMa != nil {
             watts = Double(v) * Double(amps) / 1_000_000.0
         }
-        
-        // Time remaining
-        let timeRem = isCharging ? regexInt("AvgTimeToFull") : regexInt("AvgTimeToEmpty")
+
+        let timeRem = isCharging
+            ? firstInt(["AvgTimeToFull"], in: [batt, battData])
+            : firstInt(["AvgTimeToEmpty"], in: [batt, battData])
         let cleanTimeRem = (timeRem ?? 65535) >= 60000 ? nil : timeRem
-        
+
         if cached == nil {
             var chipName = "Apple Silicon"
             var sysctlBuf = [CChar](repeating: 0, count: 128)
@@ -849,15 +770,7 @@ enum MacBatteryReader {
                 modelRelDate = relD
             }
 
-            var serialNum: String? = nil
-            let pText = run("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"])
-            let pat = "\"IOPlatformSerialNumber\"\\s*=\\s*\"([^\"]+)\""
-            if let re = try? NSRegularExpression(pattern: pat),
-               let m = re.firstMatch(in: pText, range: NSRange(location: 0, length: pText.utf16.count)),
-               let r = Range(m.range(at: 1), in: pText) {
-                serialNum = String(pText[r])
-            }
-
+            let serialNum = asString(serviceProperties("IOPlatformExpertDevice")?["IOPlatformSerialNumber"])
             let devMfgDate: Date? = AppleModelDatabase.decodeDeviceSerialDate(serialNum)
 
             var macFirstUseDate: Date? = nil
@@ -872,7 +785,7 @@ enum MacBatteryReader {
             }
 
             var battMfgDate: Date? = nil
-            if let mfgRaw = regexInt("ManufactureDate"), mfgRaw > 0 {
+            if let mfgRaw = asInt(batt["ManufactureDate"]), mfgRaw > 0 {
                 let d = mfgRaw & 0x1F
                 let m = (mfgRaw >> 5) & 0x0F
                 let y = ((mfgRaw >> 9) & 0x7F) + 1980
@@ -884,7 +797,7 @@ enum MacBatteryReader {
                     battMfgDate = Calendar.current.date(from: comp)
                 }
             }
-            if battMfgDate == nil, let battSerial = regexStr("Serial") ?? regexStr("BatterySerialNumber") {
+            if battMfgDate == nil, let battSerial = asString(batt["Serial"]) ?? asString(batt["BatterySerialNumber"]) ?? asString(packData["Serial"]) {
                 battMfgDate = AppleModelDatabase.decodeBatterySerialDate(battSerial)
             }
 
@@ -928,8 +841,7 @@ enum MacBatteryReader {
         }
 
         let ident = cached!
-        
-        // USB-PD handshake
+
         var pdOn: Bool? = nil
         var pdVolts: Double? = nil
         var pdWatts: Int? = nil
@@ -948,8 +860,8 @@ enum MacBatteryReader {
             let d = Double(n)
             return abs(d) > 200 ? d / 1000.0 : d
         }
-        let systemLoadW = milliToWatts(regexInt("SystemLoad"))
-        let adapterInW = milliToWatts(regexInt("SystemPowerIn"))
+        let systemLoadW = milliToWatts(asInt(telemetry["SystemLoad"]) ?? asInt(batt["SystemLoad"]))
+        let adapterInW = milliToWatts(asInt(telemetry["SystemPowerIn"]) ?? asInt(batt["SystemPowerIn"]))
 
         return DeviceBatteryData(
             deviceId: "local_mac",
@@ -1270,10 +1182,10 @@ def recvn(sock, n, cap=4_000_000):
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Direct pure-Swift native UNIX socket query to /var/run/usbmuxd (< 1ms execution, zero subprocesses)
-    static func queryUsbmuxdNative() -> [(udid: String, isNetwork: Bool)] {
+    /// Direct usbmuxd list. nil means the query failed. An empty array means nothing is plugged in.
+    static func queryUsbmuxdNative() -> [(udid: String, isNetwork: Bool)]? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return [] }
+        guard fd >= 0 else { return nil }
         defer { close(fd) }
         
         var addr = sockaddr_un()
@@ -1291,7 +1203,7 @@ def recvn(sock, n, cap=4_000_000):
                 connect(fd, $0, addrLen)
             }
         }
-        guard connectRes == 0 else { return [] }
+        guard connectRes == 0 else { return nil }
         
         let reqDict: [String: Any] = [
             "MessageType": "ListDevices",
@@ -1299,7 +1211,7 @@ def recvn(sock, n, cap=4_000_000):
             "ProgName": "BW"
         ]
         guard let plistData = try? PropertyListSerialization.data(fromPropertyList: reqDict, format: .xml, options: 0) else {
-            return []
+            return nil
         }
         
         var totalLen = UInt32(16 + plistData.count).littleEndian
@@ -1315,15 +1227,15 @@ def recvn(sock, n, cap=4_000_000):
         packet.append(plistData)
         
         let sent = packet.withUnsafeBytes { send(fd, $0.baseAddress, packet.count, 0) }
-        guard sent == packet.count else { return [] }
+        guard sent == packet.count else { return nil }
         
         var hdrBuf = [UInt8](repeating: 0, count: 16)
         let readBytes = recv(fd, &hdrBuf, 16, 0)
-        guard readBytes == 16 else { return [] }
+        guard readBytes == 16 else { return nil }
         
         let replyLen = hdrBuf.withUnsafeBytes { $0.load(as: UInt32.self) }
         let payloadLen = Int(replyLen) - 16
-        guard payloadLen > 0 && payloadLen < 1_000_000 else { return [] }
+        guard payloadLen > 0 && payloadLen < 1_000_000 else { return nil }
         
         var payloadBuf = [UInt8](repeating: 0, count: payloadLen)
         var totalPayloadRead = 0
@@ -1332,12 +1244,12 @@ def recvn(sock, n, cap=4_000_000):
             guard chunk > 0 else { break }
             totalPayloadRead += chunk
         }
-        guard totalPayloadRead == payloadLen else { return [] }
+        guard totalPayloadRead == payloadLen else { return nil }
         
         let payloadData = Data(payloadBuf)
         guard let plist = try? PropertyListSerialization.propertyList(from: payloadData, options: [], format: nil) as? [String: Any],
               let devList = plist["DeviceList"] as? [[String: Any]] else {
-            return []
+            return nil
         }
         
         var results: [(udid: String, isNetwork: Bool)] = []
@@ -1353,10 +1265,10 @@ def recvn(sock, n, cap=4_000_000):
 
     /// List connected USB & Network device UDIDs via native usbmuxd and idevice_id
     static func listConnectedUDIDs() -> [(udid: String, isNetwork: Bool)] {
-        var rawResult = queryUsbmuxdNative()
-        
-        // 1. Fallback to lightweight python query if native usbmuxd query returned nothing
-        if rawResult.isEmpty {
+        var rawResult: [(udid: String, isNetwork: Bool)] = []
+        if let native = queryUsbmuxdNative() {
+            rawResult = native
+        } else {
             let pyScript = pyGuard + """
 import socket, plistlib, struct, json
 if hasattr(signal, 'alarm'): signal.alarm(2)
@@ -1391,20 +1303,19 @@ except:
                     }
                 }
             }
-        }
 
-        // 2. Fallback to idevice_id if usbmuxd didn't return devices
-        if rawResult.isEmpty, let toolId = tool("idevice_id") {
-            if let out = run(toolId, args: ["-l"], timeout: 1.5) {
-                for line in out.components(separatedBy: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
-                    rawResult.append((line.trimmingCharacters(in: .whitespaces), false))
+            if rawResult.isEmpty, let toolId = tool("idevice_id") {
+                if let out = run(toolId, args: ["-l"], timeout: 1.5) {
+                    for line in out.components(separatedBy: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        rawResult.append((line.trimmingCharacters(in: .whitespaces), false))
+                    }
                 }
-            }
-            if let outNet = run(toolId, args: ["-n"], timeout: 2.0) {
-                for line in outNet.components(separatedBy: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
-                    let trimmed = line.trimmingCharacters(in: .whitespaces)
-                    if !rawResult.contains(where: { $0.udid == trimmed }) {
-                        rawResult.append((trimmed, true))
+                if let outNet = run(toolId, args: ["-n"], timeout: 2.0) {
+                    for line in outNet.components(separatedBy: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                        if !rawResult.contains(where: { $0.udid == trimmed }) {
+                            rawResult.append((trimmed, true))
+                        }
                     }
                 }
             }
@@ -1471,8 +1382,6 @@ def run():
                 else:
                     target = p
                     break
-        if not target and sorted_devs:
-            target = sorted_devs[0].get('Properties', {})
         if not target:
             print('{}')
             return
@@ -2657,11 +2566,6 @@ final class BatteryWidgetViewModel: ObservableObject {
         finalDevices.append(enrichedMac)
         self.recordHistory(enrichedMac)
 
-        let ip17Points = self.historyPoints.filter { pt in
-            pt.deviceType != .mac && pt.deviceId != "local_mac" && !pt.deviceId.contains("26cc71869") && !(pt.deviceName?.contains("15") ?? false)
-        }
-        let last17 = ip17Points.sorted(by: { $0.date < $1.date }).last
-
         // Prefer wired (non-wireless) connection first if multiple entries exist
         let preferredOnlinePhone = self.lastIOSDevices
             .filter { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") }
@@ -2678,6 +2582,11 @@ final class BatteryWidgetViewModel: ObservableObject {
             cachedPhone.uptimeSeconds = nil
             finalDevices.insert(cachedPhone, at: 0)
         } else {
+            let last17 = historyPoints
+                .filter { pt in
+                    pt.deviceType != .mac && pt.deviceId != "local_mac" && !pt.deviceId.contains("26cc71869") && !(pt.deviceName?.contains("15") ?? false)
+                }
+                .max(by: { $0.date < $1.date })
             let lastKnownPct: Double = {
                 let saved = UserDefaults.standard.double(forKey: "ibw.lastKnowniPhonePct")
                 if saved > 0.0 { return saved }
@@ -3486,10 +3395,11 @@ final class WidgetNotificationManager: NSObject, UNUserNotificationCenterDelegat
         content.sound = .none
         
         let req = UNNotificationRequest(identifier: "ibw.notif.\(UUID().uuidString)", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req) { _ in }
-        
-        // 2. Guaranteed notification banner presentation via isolated subprocess
-        Self.deliverViaAppleScript(title: title, body: body)
+        UNUserNotificationCenter.current().add(req) { error in
+            if error != nil {
+                Self.deliverViaAppleScript(title: title, body: body)
+            }
+        }
     }
 
     static func deliverViaAppleScript(title: String, body: String) {
@@ -3951,6 +3861,8 @@ struct BatteryDegradationGraphCanvas: View {
     let designCapacity: Double?
     var comparisonPoints: [BatteryHistoryPoint] = []
     var comparisonLabel: String = "iPhone 15"
+    var fixedMinTime: Double? = nil
+    var fixedMaxTime: Double? = nil
     
     @State private var hoveredPoint: BatteryHistoryPoint? = nil
     @State private var hoverXLocation: CGFloat? = nil
@@ -3972,8 +3884,10 @@ struct BatteryDegradationGraphCanvas: View {
                 let firstT = validPoints.first!.date.timeIntervalSince1970
                 let lastT = validPoints.last!.date.timeIntervalSince1970
                 let span = lastT - firstT
-                let minT = span < 3600 ? (firstT - 3600) : firstT
-                let maxT = span < 3600 ? (lastT + 3600) : (firstT == lastT ? firstT + 86400 : lastT)
+                let minT = fixedMinTime ?? (span < 3600 ? (firstT - 3600) : firstT)
+                let rawMaxT = fixedMaxTime ?? (span < 3600 ? (lastT + 3600) : (firstT == lastT ? firstT + 86400 : lastT))
+                let maxT = rawMaxT <= minT ? minT + 86400 : rawMaxT
+                let axisSpan = maxT - minT
 
                 // Computed ranges
                 let healthPoints = validPoints.compactMap { pt -> (t: Double, val: Double)? in
@@ -4228,7 +4142,7 @@ struct BatteryDegradationGraphCanvas: View {
 
                     // X-Axis Timeline Dates
                     HStack {
-                        Text(formatXDate(validPoints.first!.date))
+                        Text(formatXDate(Date(timeIntervalSince1970: minT), span: axisSpan))
                             .font(.system(size: 9, weight: .medium))
                             .foregroundColor(.white.opacity(0.4))
                         Spacer()
@@ -4249,7 +4163,7 @@ struct BatteryDegradationGraphCanvas: View {
                                 .foregroundColor(.white.opacity(0.3))
                         }
                         Spacer()
-                        Text(formatXDate(validPoints.last!.date))
+                        Text(formatXDate(Date(timeIntervalSince1970: maxT), span: axisSpan))
                             .font(.system(size: 9, weight: .bold))
                             .foregroundColor(Color(hex: "#0A84FF"))
                     }
@@ -4296,9 +4210,9 @@ struct BatteryDegradationGraphCanvas: View {
         }
     }
 
-    private func formatXDate(_ d: Date) -> String {
+    private func formatXDate(_ d: Date, span: TimeInterval) -> String {
         let f = DateFormatter()
-        f.dateFormat = "MMM yyyy"
+        f.dateFormat = span < 70 * 86400 ? "d MMM" : "MMM yyyy"
         return f.string(from: d)
     }
 
@@ -4936,6 +4850,7 @@ final class HistoryUIState: ObservableObject {
     @Published var aggregateDaily: Bool = true
     @Published var sortAscending: Bool = false
     @Published var compareWithOldiPhone: Bool = false
+    @Published var selectedGraphRange: BatteryHistoryChartView.GraphRange = .all
     @Published var selectedTempSection: BatteryHistoryChartView.TempChartSection = .today
     @Published var selectedCustomDateKey: String? = nil
     @Published var selectedLidSection: BatteryHistoryChartView.LidSessionSection = .today
@@ -4958,11 +4873,33 @@ struct BatteryHistoryChartView: View {
         case updates      = "Software Updates"
     }
 
+    enum GraphRange: String, CaseIterable {
+        case oneMonth = "1 Month"
+        case threeMonths = "3 Months"
+        case sixMonths = "6 Months"
+        case twelveMonths = "12 Months"
+        case all = "All"
+
+        var months: Int? {
+            switch self {
+            case .oneMonth: return 1
+            case .threeMonths: return 3
+            case .sixMonths: return 6
+            case .twelveMonths: return 12
+            case .all: return nil
+            }
+        }
+    }
+
     enum TempChartSection: String, CaseIterable {
         case today     = "Today"
         case yesterday = "Yesterday"
         case last7     = "Last 7 Days"
         case last30    = "Last 30 Days"
+        case oneMonth  = "1 Month"
+        case threeMonths = "3 Months"
+        case sixMonths = "6 Months"
+        case twelveMonths = "12 Months"
         case all       = "All History"
     }
 
@@ -4986,6 +4923,7 @@ struct BatteryHistoryChartView: View {
     private var aggregateDaily: Bool { get { ui.aggregateDaily } nonmutating set { ui.aggregateDaily = newValue } }
     private var sortAscending: Bool { get { ui.sortAscending } nonmutating set { ui.sortAscending = newValue } }
     private var compareWithOldiPhone: Bool { get { ui.compareWithOldiPhone } nonmutating set { ui.compareWithOldiPhone = newValue } }
+    private var selectedGraphRange: GraphRange { get { ui.selectedGraphRange } nonmutating set { ui.selectedGraphRange = newValue } }
     private var selectedTempSection: TempChartSection { get { ui.selectedTempSection } nonmutating set { ui.selectedTempSection = newValue } }
     private var selectedCustomDateKey: String? { get { ui.selectedCustomDateKey } nonmutating set { ui.selectedCustomDateKey = newValue } }
     private var selectedLidSection: LidSessionSection { get { ui.selectedLidSection } nonmutating set { ui.selectedLidSection = newValue } }
@@ -5191,8 +5129,15 @@ struct BatteryHistoryChartView: View {
             : base.sorted(by: { $0.date > $1.date })
     }
 
+    private var graphRangeStart: Date? {
+        guard let months = selectedGraphRange.months else { return nil }
+        return Calendar.current.date(byAdding: .month, value: -months, to: Date())
+    }
+
     private var graphPoints: [BatteryHistoryPoint] {
-        allMatchedSorted
+        let sorted = matchedPoints.sorted(by: { $0.date < $1.date })
+        guard let start = graphRangeStart else { return sorted }
+        return sorted.filter { $0.date >= start }
     }
 
     private var deviceHistoryPoints: [BatteryHistoryPoint] {
@@ -5683,6 +5628,18 @@ struct BatteryHistoryChartView: View {
         case .last30:
             let s = cal.date(byAdding: .day, value: -30, to: now) ?? now.addingTimeInterval(-30*86400)
             return (s, now, false, "Last 30 Days")
+        case .oneMonth:
+            let s = cal.date(byAdding: .month, value: -1, to: now) ?? now.addingTimeInterval(-30*86400)
+            return (s, now, false, "Last 1 Month")
+        case .threeMonths:
+            let s = cal.date(byAdding: .month, value: -3, to: now) ?? now.addingTimeInterval(-90*86400)
+            return (s, now, false, "Last 3 Months")
+        case .sixMonths:
+            let s = cal.date(byAdding: .month, value: -6, to: now) ?? now.addingTimeInterval(-182*86400)
+            return (s, now, false, "Last 6 Months")
+        case .twelveMonths:
+            let s = cal.date(byAdding: .month, value: -12, to: now) ?? now.addingTimeInterval(-365*86400)
+            return (s, now, false, "Last 12 Months")
         case .all:
             let allT = matchedPoints.filter { $0.temperatureC != nil }
             let s = allT.first?.date ?? now.addingTimeInterval(-86400)
@@ -5717,10 +5674,12 @@ struct BatteryHistoryChartView: View {
 
     private var tempTimeframeSelectorBar: some View {
         HStack(spacing: 8) {
-            HStack(spacing: 4) {
-                ForEach(TempChartSection.allCases, id: \.self) { section in
-                    let isSelected = (selectedCustomDateKey == nil && selectedTempSection == section)
-                    tempSectionButton(section: section, isSelected: isSelected)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(TempChartSection.allCases, id: \.self) { section in
+                        let isSelected = (selectedCustomDateKey == nil && selectedTempSection == section)
+                        tempSectionButton(section: section, isSelected: isSelected)
+                    }
                 }
             }
 
@@ -5865,8 +5824,8 @@ struct BatteryHistoryChartView: View {
 
             DailyTemperatureGraphCanvas(
                 points: sectionPoints,
-                fixedMinTime: range.isSingleDay ? range.start.timeIntervalSince1970 : nil,
-                fixedMaxTime: range.isSingleDay ? range.end.timeIntervalSince1970 : nil,
+                fixedMinTime: (range.isSingleDay || selectedTempSection != .all) ? range.start.timeIntervalSince1970 : nil,
+                fixedMaxTime: (range.isSingleDay || selectedTempSection != .all) ? range.end.timeIntervalSince1970 : nil,
                 isSingleDay: range.isSingleDay
             )
             .frame(height: 180)
@@ -6032,6 +5991,7 @@ struct BatteryHistoryChartView: View {
             // Interactive Degradation Chart Card
             VStack(alignment: .leading, spacing: 10) {
                 graphCardHeader
+                graphRangePills
 
                 // Degradation Canvas (Uses all matched snapshots + baseline for rich continuous trajectory)
                 let comparisonList: [BatteryHistoryPoint] = (compareWithOldiPhone && (activeDevice?.deviceName.contains("17") == true || activeDevice?.hardwareModel?.contains("17") == true)) ? vm.historyPoints.filter { $0.deviceId.contains("26cc71869") || ($0.deviceName?.contains("15") ?? false) } : []
@@ -6042,7 +6002,9 @@ struct BatteryHistoryChartView: View {
                     showCapacity: showCapacityGraph,
                     designCapacity: activeDevice?.designCapacityMah.map { Double($0) },
                     comparisonPoints: comparisonList,
-                    comparisonLabel: "iPhone 15"
+                    comparisonLabel: "iPhone 15",
+                    fixedMinTime: graphRangeStart?.timeIntervalSince1970,
+                    fixedMaxTime: graphRangeStart == nil ? nil : Date().timeIntervalSince1970
                 )
                 .frame(height: 170)
                 .background(Color.black.opacity(0.3).cornerRadius(10))
@@ -6066,7 +6028,7 @@ struct BatteryHistoryChartView: View {
                     .font(.system(size: 13, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                 if let dev = activeDevice {
-                    Text("Complete trajectory for \(dev.deviceName) from \(graphPoints.count) data points")
+                    Text("\(selectedGraphRange == .all ? "Complete trajectory" : selectedGraphRange.rawValue) for \(dev.deviceName) from \(graphPoints.count) data points")
                         .font(.system(size: 10))
                         .foregroundColor(.white.opacity(0.5))
                 }
@@ -6075,6 +6037,31 @@ struct BatteryHistoryChartView: View {
             Spacer()
 
             graphTogglePills
+        }
+    }
+
+    private var graphRangePills: some View {
+        HStack(spacing: 4) {
+            ForEach(GraphRange.allCases, id: \.self) { range in
+                let isSelected = selectedGraphRange == range
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        selectedGraphRange = range
+                    }
+                } label: {
+                    Text(range.rawValue)
+                        .font(.system(size: 11, weight: isSelected ? .bold : .medium, design: .rounded))
+                        .foregroundColor(isSelected ? Color.white : Color.white.opacity(0.6))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(isSelected ? Color(hex: "#0A84FF").opacity(0.28) : Color.white.opacity(0.04))
+                        .clipShape(Capsule())
+                        .overlay(
+                            Capsule().stroke(isSelected ? Color(hex: "#0A84FF").opacity(0.7) : Color.white.opacity(0.08), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
         }
     }
 
