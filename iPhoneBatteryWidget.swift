@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.10"
+    static let appVersion = "1.0.17"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -207,6 +207,26 @@ func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: S
     return "J. iPhone 17 Pro"
 }
 
+/// Same physical phone, including the UDID and serial aliases already in the archive.
+func phoneGroupKey(deviceId: String, serial: String? = nil, name: String? = nil, model: String? = nil) -> String {
+    let id = deviceId.lowercased()
+    let serialL = (serial ?? "").lowercased()
+    let nameL = (name ?? "").lowercased()
+    let modelL = (model ?? "").lowercased()
+    let blob = "\(id) \(serialL) \(nameL) \(modelL)"
+    if id == "local_mac" || blob.contains("macbook") || modelL.contains("mac") { return "local_mac" }
+    if blob.contains("26cc71869") || blob.contains("h96fx2j6t3") || modelL.contains("iphone15,4") || nameL.contains("iphone 15") {
+        return "iphone-15"
+    }
+    if blob.contains("00008150-001528481ada401c") || blob.contains("djrxc6f3qc") || modelL == "iphone18,1" || nameL.contains("17 pro") || modelL.contains("17 pro") {
+        return "iphone-17-pro"
+    }
+    if modelL.contains("iphone19,") || nameL.contains("18 pro") || modelL.contains("18 pro") {
+        return "iphone-18-pro"
+    }
+    return id.isEmpty ? blob : id
+}
+
 func canonicalDeviceModelName(model: String?, name: String? = nil, deviceId: String? = nil, deviceType: DeviceType? = nil) -> String {
     if let m = model, !m.isEmpty {
         let lower = m.lowercased()
@@ -322,6 +342,9 @@ enum AppleModelDatabase {
             "MacBookAir8,1": ("MacBook Air (Retina, 2018)", d("2018-10-30")),
             
             // iPhones
+            "iPhone19,2": ("iPhone 18 Pro", d("2026-09-18")),
+            "iPhone19,3": ("iPhone 18 Pro", d("2026-09-18")),
+            "iPhone19,7": ("iPhone 18 Pro", d("2026-09-18")),
             "iPhone18,1": ("iPhone 17 Pro", d("2025-09-19")),
             "iPhone18,2": ("iPhone 17 Pro Max", d("2025-09-19")),
             "iPhone18,3": ("iPhone 17", d("2025-09-19")),
@@ -365,6 +388,9 @@ enum AppleModelDatabase {
     static func lookupBatterySpecs(model: String) -> (mah: Int, wh: Double) {
         let clean = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let specs: [String: (Int, Double)] = [
+            "iPhone19,2": (3582, 13.95), // iPhone 18 Pro
+            "iPhone19,3": (3582, 13.95),
+            "iPhone19,7": (3582, 13.95),
             "iPhone18,1": (3945, 15.2), // iPhone 17 Pro
             "iPhone18,2": (4850, 18.8), // iPhone 17 Pro Max
             "iPhone18,3": (3650, 14.2), // iPhone 17
@@ -457,6 +483,7 @@ enum AppleModelDatabase {
 
     static func lookupProcessor(model: String?, deviceName: String?, deviceType: DeviceType) -> String? {
         let text = "\(model ?? "") \(deviceName ?? "")".lowercased()
+        if text.contains("iphone19") || text.contains("18 pro") { return "Apple A20 Pro" }
         if text.contains("iphone18,1") || text.contains("17 pro max") { return "Apple A19 Pro" }
         if text.contains("iphone18") || text.contains("17 pro") { return "Apple A19 Pro" }
         if text.contains("iphone 17") { return "Apple A19" }
@@ -1979,6 +2006,35 @@ struct LidSession: Identifiable, Codable, Equatable {
 final class MacLidTracker {
     static let shared = MacLidTracker()
 
+    /// Returns the start Date of the current day cycle using a 5:00 AM cutoff.
+    /// If current time is >= 5:00 AM, the cycle started at 5:00 AM today.
+    /// If current time is < 5:00 AM, the cycle started at 5:00 AM yesterday.
+    static func lidCycleStartDate(for date: Date = Date(), cutoffHour: Int = 5) -> Date {
+        let cal = Calendar.current
+        let hour = cal.component(.hour, from: date)
+        let baseDate: Date
+        if hour >= cutoffHour {
+            baseDate = date
+        } else {
+            baseDate = cal.date(byAdding: .day, value: -1, to: date) ?? date
+        }
+        return cal.date(bySettingHour: cutoffHour, minute: 0, second: 0, of: baseDate) ?? cal.startOfDay(for: date)
+    }
+
+    /// Determines if a given date falls within the current day cycle starting at 5:00 AM.
+    static func isDateInCurrentLidDayCycle(_ date: Date, referenceDate: Date = Date(), cutoffHour: Int = 5) -> Bool {
+        let cycleStart = lidCycleStartDate(for: referenceDate, cutoffHour: cutoffHour)
+        let cycleEnd = Calendar.current.date(byAdding: .day, value: 1, to: cycleStart) ?? referenceDate
+        return date >= cycleStart && date < cycleEnd
+    }
+
+    /// Determines if a given date falls within the previous day cycle (yesterday 5:00 AM to today 5:00 AM).
+    static func isDateInPreviousLidDayCycle(_ date: Date, referenceDate: Date = Date(), cutoffHour: Int = 5) -> Bool {
+        let currentCycleStart = lidCycleStartDate(for: referenceDate, cutoffHour: cutoffHour)
+        let prevCycleStart = Calendar.current.date(byAdding: .day, value: -1, to: currentCycleStart) ?? referenceDate
+        return date >= prevCycleStart && date < currentCycleStart
+    }
+
     func fetchAllLidSessions() -> [LidSession] {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -1988,28 +2044,36 @@ final class MacLidTracker {
         let startStr = df.string(from: sevenDaysAgo)
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        proc.arguments = ["-g", "log", "--start", startStr]
+        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
+        let cmd = "/usr/bin/pmset -g log --start '\(startStr)' | /usr/bin/grep -E 'com\\.apple\\.powermanagement\\.lidopen|Clamshell Sleep'"
+        proc.arguments = ["-c", cmd]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = Pipe()
+
+        var outputData = Data()
+        let group = DispatchGroup()
+        group.enter()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            outputData = pipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
         do {
             try proc.run()
         } catch {
             return []
         }
 
-        let start = Date()
-        while proc.isRunning && Date().timeIntervalSince(start) < 2.0 {
-            usleep(20_000)
-        }
-        if proc.isRunning {
+        let result = group.wait(timeout: .now() + 6.0)
+        if result == .timedOut {
             proc.terminate()
             return []
         }
-        guard proc.terminationStatus == 0 else { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else {
+        proc.waitUntilExit()
+
+        guard let output = String(data: outputData, encoding: .utf8) else {
             return []
         }
 
@@ -2065,9 +2129,8 @@ final class MacLidTracker {
     }
 
     func fetchTodayLidSessions() -> (firstOpen: Date?, sessions: [LidSession]) {
-        let cal = Calendar.current
         let all = fetchAllLidSessions()
-        let todaySessions = all.filter { cal.isDateInToday($0.openDate) }
+        let todaySessions = all.filter { MacLidTracker.isDateInCurrentLidDayCycle($0.openDate) }
         let firstOpen = todaySessions.min(by: { $0.openDate < $1.openDate })?.openDate
         return (firstOpen, todaySessions)
     }
@@ -2246,7 +2309,6 @@ final class BatteryWidgetViewModel: ObservableObject {
     func refreshLidSessions() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let cal = Calendar.current
             let freshSessions = MacLidTracker.shared.fetchAllLidSessions()
             
             DispatchQueue.main.async {
@@ -2260,7 +2322,7 @@ final class BatteryWidgetViewModel: ObservableObject {
                 }
                 let merged = Array(map.values).sorted(by: { $0.openDate > $1.openDate })
                 self.allLidSessions = merged
-                self.todayLidSessions = merged.filter { cal.isDateInToday($0.openDate) }
+                self.todayLidSessions = merged.filter { MacLidTracker.isDateInCurrentLidDayCycle($0.openDate) }
                 self.firstLidOpenToday = self.todayLidSessions.min(by: { $0.openDate < $1.openDate })?.openDate
                 self.saveLidSessions()
             }
@@ -2392,8 +2454,7 @@ final class BatteryWidgetViewModel: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: kLidHistoryLogKey),
            let savedSessions = try? JSONDecoder().decode([LidSession].self, from: data) {
             self.allLidSessions = savedSessions
-            let cal = Calendar.current
-            self.todayLidSessions = savedSessions.filter { cal.isDateInToday($0.openDate) }
+            self.todayLidSessions = savedSessions.filter { MacLidTracker.isDateInCurrentLidDayCycle($0.openDate) }
             self.firstLidOpenToday = self.todayLidSessions.min(by: { $0.openDate < $1.openDate })?.openDate
         }
     }
@@ -2455,7 +2516,10 @@ final class BatteryWidgetViewModel: ObservableObject {
     }
 
     func refresh(manual: Bool) {
-        if manual { isRefreshing = true }
+        if manual {
+            isRefreshing = true
+            refreshLidSessions()
+        }
 
         // 1. Fetch Mac telemetry asynchronously and apply immediately to avoid UI stalling
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -2844,10 +2908,28 @@ final class BatteryWidgetViewModel: ObservableObject {
             )
             historyPoints.append(pt)
             historyDirty = true
-            if historyPoints.count > 5000 {
-                historyPoints.removeFirst(historyPoints.count - 5000)
-            }
+            trimHistoryKeepingEveryPhone()
         }
+    }
+
+    /// Drop the oldest samples from the busiest device. A retired phone's archive is never the first thing removed.
+    private func trimHistoryKeepingEveryPhone() {
+        let cap = 8000
+        guard historyPoints.count > cap else { return }
+        var pts = historyPoints.sorted(by: { $0.date < $1.date })
+        while pts.count > cap {
+            var counts: [String: Int] = [:]
+            for pt in pts {
+                let key = phoneGroupKey(deviceId: pt.deviceId, serial: pt.deviceSerial, name: pt.deviceName, model: pt.deviceModel)
+                counts[key, default: 0] += 1
+            }
+            guard let fatKey = counts.max(by: { $0.value < $1.value })?.key,
+                  let idx = pts.firstIndex(where: {
+                      phoneGroupKey(deviceId: $0.deviceId, serial: $0.deviceSerial, name: $0.deviceName, model: $0.deviceModel) == fatKey
+                  }) else { break }
+            pts.remove(at: idx)
+        }
+        historyPoints = pts
     }
 
     private func considerPDHandshakeHint(_ mac: DeviceBatteryData) {
@@ -3104,10 +3186,19 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
+    private var lastLidSessionCheck: Date = .distantPast
+
     private func startTimer() {
         timer?.invalidate()
         let t = Timer(timeInterval: kPollInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.refresh(manual: false) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.refresh(manual: false)
+                if Date().timeIntervalSince(self.lastLidSessionCheck) >= 60.0 {
+                    self.lastLidSessionCheck = Date()
+                    self.refreshLidSessions()
+                }
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -3853,6 +3944,50 @@ struct SevenDayLineGraphCanvas: View {
 
 // MARK: - Interactive Health, Cycles & Capacity Degradation Canvas with Hover Details
 
+private struct CycleHealthLines: View {
+    let main: [(cycle: Int, health: Double, point: BatteryHistoryPoint)]
+    let comparison: [(cycle: Int, health: Double, point: BatteryHistoryPoint)]
+    let cycleMin: Int
+    let cycleMax: Int
+    let padL: CGFloat
+    let padT: CGFloat
+    let plotW: CGFloat
+    let plotH: CGFloat
+    let width: CGFloat
+    let height: CGFloat
+
+    private func xForCycle(_ cycle: Int) -> CGFloat {
+        let span = Double(max(1, cycleMax - cycleMin))
+        return padL + CGFloat((Double(cycle) - Double(cycleMin)) / span) * plotW
+    }
+
+    private func yForHealth(_ health: Double) -> CGFloat {
+        let norm = (health - 75.0) / 30.0
+        return padT + plotH - CGFloat(max(0, min(1, norm))) * plotH
+    }
+
+    var body: some View {
+        ZStack {
+            Path { p in
+                for (i, sample) in main.enumerated() {
+                    let point = CGPoint(x: xForCycle(sample.cycle), y: yForHealth(sample.health))
+                    if i == 0 { p.move(to: point) } else { p.addLine(to: point) }
+                }
+            }
+            .stroke(Color(hex: "#30D158"), lineWidth: 2.5)
+
+            Path { p in
+                for (i, sample) in comparison.enumerated() {
+                    let point = CGPoint(x: xForCycle(sample.cycle), y: yForHealth(sample.health))
+                    if i == 0 { p.move(to: point) } else { p.addLine(to: point) }
+                }
+            }
+            .stroke(Color(hex: "#CB64F4"), style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
+        }
+        .frame(width: width, height: height, alignment: .topLeading)
+    }
+}
+
 struct BatteryDegradationGraphCanvas: View {
     let points: [BatteryHistoryPoint]
     let showHealth: Bool
@@ -3861,8 +3996,25 @@ struct BatteryDegradationGraphCanvas: View {
     let designCapacity: Double?
     var comparisonPoints: [BatteryHistoryPoint] = []
     var comparisonLabel: String = "iPhone 15"
+    var alignByCycles: Bool = false
     var fixedMinTime: Double? = nil
     var fixedMaxTime: Double? = nil
+
+    private func cycleHealthSeries(_ pts: [BatteryHistoryPoint]) -> [(cycle: Int, health: Double, point: BatteryHistoryPoint)] {
+        var best: [Int: BatteryHistoryPoint] = [:]
+        for pt in pts {
+            guard let cycle = pt.cycleCount, pt.healthPct != nil else { continue }
+            if let prev = best[cycle] {
+                if pt.date >= prev.date { best[cycle] = pt }
+            } else {
+                best[cycle] = pt
+            }
+        }
+        return best.keys.sorted().compactMap { cycle in
+            guard let pt = best[cycle], let health = pt.healthPct else { return nil }
+            return (cycle, health, pt)
+        }
+    }
     
     @State private var hoveredPoint: BatteryHistoryPoint? = nil
     @State private var hoverXLocation: CGFloat? = nil
@@ -3879,6 +4031,11 @@ struct BatteryDegradationGraphCanvas: View {
             let plotH = max(10, h - padT - padB)
 
             let validPoints = points.sorted(by: { $0.date < $1.date })
+            let cycleAligned = alignByCycles && !comparisonPoints.isEmpty
+            let mainCycleSeries = cycleAligned ? cycleHealthSeries(validPoints) : []
+            let compCycleSeries = cycleAligned ? cycleHealthSeries(comparisonPoints) : []
+            let cycleMin = (mainCycleSeries + compCycleSeries).map(\.cycle).min() ?? 0
+            let cycleMax = max(cycleMin + 1, (mainCycleSeries + compCycleSeries).map(\.cycle).max() ?? 1)
 
             if !validPoints.isEmpty {
                 let firstT = validPoints.first!.date.timeIntervalSince1970
@@ -3948,7 +4105,7 @@ struct BatteryDegradationGraphCanvas: View {
                     .frame(width: padL - 6, height: plotH)
 
                     // 1. Capacity Line (Cyan)
-                    if showCapacity && !capPoints.isEmpty {
+                    if showCapacity && !capPoints.isEmpty && !cycleAligned {
                         let capCurve = Path { p in
                             for (i, pt) in capPoints.enumerated() {
                                 let x = padL + CGFloat((pt.t - minT) / (maxT - minT)) * plotW
@@ -3962,7 +4119,7 @@ struct BatteryDegradationGraphCanvas: View {
                     }
 
                     // 2. Cycles Curve (Amber / Yellow)
-                    if showCycles && !cyclePoints.isEmpty {
+                    if showCycles && !cyclePoints.isEmpty && !cycleAligned {
                         let cycleCurve = Path { p in
                             for (i, pt) in cyclePoints.enumerated() {
                                 let x = padL + CGFloat((pt.t - minT) / (maxT - minT)) * plotW
@@ -3976,7 +4133,7 @@ struct BatteryDegradationGraphCanvas: View {
                     }
 
                     // 3. Health Degradation Line & Gradient Fill (Green -> Orange)
-                    if showHealth && !healthPoints.isEmpty {
+                    if showHealth && !healthPoints.isEmpty && !cycleAligned {
                         // Area fill
                         Path { p in
                             let firstX = padL + CGFloat((healthPoints[0].t - minT) / (maxT - minT)) * plotW
@@ -4030,29 +4187,19 @@ struct BatteryDegradationGraphCanvas: View {
                         }
                     }
 
-                    // 3b. Comparison Degradation Line (Dashed Lilac / Purple)
-                    if showHealth && !comparisonPoints.isEmpty {
-                        let compHealth = comparisonPoints.sorted(by: { $0.date < $1.date }).compactMap { pt -> (t: Double, val: Double, cyc: Int?)? in
-                            guard let val = pt.healthPct else { return nil }
-                            return (pt.date.timeIntervalSince1970, val, pt.cycleCount)
-                        }
-                        if !compHealth.isEmpty {
-                            let compMinT = compHealth.first!.t
-                            let compMaxT = compHealth.last!.t
-                            let compSpan = max(1.0, compMaxT - compMinT)
-                            
-                            Path { p in
-                                for (i, pt) in compHealth.enumerated() {
-                                    let rel = (pt.t - compMinT) / compSpan
-                                    let x = padL + CGFloat(rel) * plotW
-                                    let norm = (pt.val - 75.0) / 30.0
-                                    let y = padT + plotH - CGFloat(max(0, min(1, norm))) * plotH
-                                    if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
-                                    else { p.addLine(to: CGPoint(x: x, y: y)) }
-                                }
-                            }
-                            .stroke(Color(hex: "#CB64F4"), style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
-                        }
+                    if showHealth && cycleAligned && !mainCycleSeries.isEmpty {
+                        CycleHealthLines(
+                            main: mainCycleSeries,
+                            comparison: compCycleSeries,
+                            cycleMin: cycleMin,
+                            cycleMax: cycleMax,
+                            padL: padL,
+                            padT: padT,
+                            plotW: plotW,
+                            plotH: plotH,
+                            width: w,
+                            height: h
+                        )
                     }
 
                     // 4. Interactive Hover Indicator Line & Details Tooltip
@@ -4142,19 +4289,19 @@ struct BatteryDegradationGraphCanvas: View {
 
                     // X-Axis Timeline Dates
                     HStack {
-                        Text(formatXDate(Date(timeIntervalSince1970: minT), span: axisSpan))
+                        Text(cycleAligned ? "\(cycleMin) cyc" : formatXDate(Date(timeIntervalSince1970: minT), span: axisSpan))
                             .font(.system(size: 9, weight: .medium))
                             .foregroundColor(.white.opacity(0.4))
                         Spacer()
-                        if !comparisonPoints.isEmpty {
+                        if cycleAligned {
                             HStack(spacing: 6) {
                                 HStack(spacing: 3) {
                                     Circle().fill(Color(hex: "#30D158")).frame(width: 5, height: 5)
-                                    Text("17 Pro").font(.system(size: 8.5, weight: .bold)).foregroundColor(Color(hex: "#30D158"))
+                                    Text("This phone").font(.system(size: 8.5, weight: .bold)).foregroundColor(Color(hex: "#30D158"))
                                 }
                                 HStack(spacing: 3) {
                                     Circle().fill(Color(hex: "#CB64F4")).frame(width: 5, height: 5)
-                                    Text("15 (Old)").font(.system(size: 8.5, weight: .bold)).foregroundColor(Color(hex: "#CB64F4"))
+                                    Text(comparisonLabel).font(.system(size: 8.5, weight: .bold)).foregroundColor(Color(hex: "#CB64F4"))
                                 }
                             }
                         } else {
@@ -4163,7 +4310,7 @@ struct BatteryDegradationGraphCanvas: View {
                                 .foregroundColor(.white.opacity(0.3))
                         }
                         Spacer()
-                        Text(formatXDate(Date(timeIntervalSince1970: maxT), span: axisSpan))
+                        Text(cycleAligned ? "\(cycleMax) cyc" : formatXDate(Date(timeIntervalSince1970: maxT), span: axisSpan))
                             .font(.system(size: 9, weight: .bold))
                             .foregroundColor(Color(hex: "#0A84FF"))
                     }
@@ -4181,13 +4328,24 @@ struct BatteryDegradationGraphCanvas: View {
                             return
                         }
                         let ratio = Double((locX - padL) / plotW)
-                        let targetT = minT + ratio * (maxT - minT)
-                        
-                        if let closest = validPoints.min(by: { abs($0.date.timeIntervalSince1970 - targetT) < abs($1.date.timeIntervalSince1970 - targetT) }) {
-                            let closestX = padL + CGFloat((closest.date.timeIntervalSince1970 - minT) / (maxT - minT)) * plotW
-                            withAnimation(.easeOut(duration: 0.08)) {
-                                self.hoveredPoint = closest
-                                self.hoverXLocation = closestX
+                        if cycleAligned {
+                            let targetCycle = Double(cycleMin) + ratio * Double(cycleMax - cycleMin)
+                            if let closest = mainCycleSeries.min(by: { abs(Double($0.cycle) - targetCycle) < abs(Double($1.cycle) - targetCycle) }) {
+                                let span = Double(cycleMax - cycleMin)
+                                let closestX = padL + CGFloat((Double(closest.cycle) - Double(cycleMin)) / span) * plotW
+                                withAnimation(.easeOut(duration: 0.08)) {
+                                    self.hoveredPoint = closest.point
+                                    self.hoverXLocation = closestX
+                                }
+                            }
+                        } else {
+                            let targetT = minT + ratio * (maxT - minT)
+                            if let closest = validPoints.min(by: { abs($0.date.timeIntervalSince1970 - targetT) < abs($1.date.timeIntervalSince1970 - targetT) }) {
+                                let closestX = padL + CGFloat((closest.date.timeIntervalSince1970 - minT) / (maxT - minT)) * plotW
+                                withAnimation(.easeOut(duration: 0.08)) {
+                                    self.hoveredPoint = closest
+                                    self.hoverXLocation = closestX
+                                }
                             }
                         }
                     case .ended:
@@ -4561,19 +4719,19 @@ struct DailyTemperatureGraphCanvas: View {
 struct ModernDataTableRowView: View {
     let index: Int
     let pt: BatteryHistoryPoint
-    let isHovered: Bool
+    let isSelected: Bool
     let activeDeviceModel: String?
     let activeDeviceName: String?
-    let onHover: (Bool) -> Void
+    @State private var hovering = false
+
+    private static let rowDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "dd/MM/yyyy, HH:mm"
+        return f
+    }()
 
     private func healthColor(_ h: Double) -> Color {
         h >= 90 ? Color(hex: "#30D158") : (h >= 80 ? Color(hex: "#FFD60A") : Color(hex: "#FF453A"))
-    }
-
-    private func formatDateCoconut(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "dd/MM/yyyy, HH:mm"
-        return f.string(from: d)
     }
 
     private var capacityText: String {
@@ -4607,7 +4765,7 @@ struct ModernDataTableRowView: View {
                 Circle()
                     .fill(pt.healthPct.map { healthColor($0) } ?? Color(hex: "#0A84FF"))
                     .frame(width: 5, height: 5)
-                Text(formatDateCoconut(pt.date))
+                Text(Self.rowDateFormatter.string(from: pt.date))
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundColor(.white.opacity(0.92))
             }
@@ -4662,12 +4820,10 @@ struct ModernDataTableRowView: View {
         }
         .padding(.vertical, 5)
         .background(
-            isHovered ? Color.white.opacity(0.08) :
+            (hovering || isSelected) ? Color.white.opacity(0.08) :
             (index % 2 == 0 ? Color.white.opacity(0.015) : Color.clear)
         )
-        .onHover { hover in
-            onHover(hover)
-        }
+        .onHover { hovering = $0 }
     }
 
     @ViewBuilder
@@ -4706,6 +4862,88 @@ struct ModernDataTableRowView: View {
         } else {
             Text("–").font(.system(size: 11)).foregroundColor(.white.opacity(0.3)).frame(width: 65, alignment: .center)
         }
+    }
+}
+
+private struct SnapshotDayDetail: View {
+    let points: [BatteryHistoryPoint]
+
+    private var batterySpan: String {
+        let values = points.map(\.batteryPct)
+        guard let lo = values.min(), let hi = values.max() else { return "–" }
+        if abs(hi - lo) < 0.05 { return String(format: "%.0f%%", hi) }
+        return String(format: "%.0f–%.0f%%", lo, hi)
+    }
+
+    /// One row per clock hour: the last snapshot taken during that hour.
+    private var hourly: [BatteryHistoryPoint] {
+        let cal = Calendar.current
+        var latest: [Date: BatteryHistoryPoint] = [:]
+        for pt in points {
+            let hour = cal.dateInterval(of: .hour, for: pt.date)?.start ?? pt.date
+            if let prev = latest[hour] {
+                if pt.date >= prev.date { latest[hour] = pt }
+            } else {
+                latest[hour] = pt
+            }
+        }
+        return latest.keys.sorted().compactMap { latest[$0] }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(hourly.count) hour\(hourly.count == 1 ? "" : "s") · \(points.count) readings · battery \(batterySpan)")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(Color(hex: "#64D2FF"))
+                .padding(.leading, 28)
+
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(spacing: 0) {
+                    ForEach(hourly) { pt in
+                        HStack(spacing: 10) {
+                            Text(timeText(pt.date))
+                                .frame(width: 52, alignment: .leading)
+                            Text(String(format: "%.0f%%", pt.batteryPct))
+                                .frame(width: 40, alignment: .leading)
+                            Text(chargeText(pt))
+                                .frame(width: 78, alignment: .leading)
+                            Text(pt.chargingWatts.map { String(format: "%.1f W", $0) } ?? "–")
+                                .frame(width: 52, alignment: .leading)
+                            Text(pt.temperatureC.map { String(format: "%.1f°C", $0) } ?? "–")
+                                .frame(width: 52, alignment: .leading)
+                            Text(pt.cycleCount.map { "\($0) cyc" } ?? "–")
+                                .frame(width: 58, alignment: .leading)
+                            Text(pt.healthPct.map { String(format: "%.1f%%", $0) } ?? "–")
+                                .frame(width: 48, alignment: .leading)
+                            Text((pt.fullChargeMah ?? pt.capacityMah).map { "\($0) mAh" } ?? "–")
+                                .frame(width: 72, alignment: .leading)
+                            Spacer(minLength: 0)
+                        }
+                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.88))
+                        .padding(.vertical, 3)
+                        .padding(.leading, 28)
+                    }
+                }
+            }
+            .frame(maxHeight: min(220, CGFloat(hourly.count) * 22 + 8))
+        }
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(hex: "#64D2FF").opacity(0.08))
+    }
+
+    private func timeText(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:00"
+        return f.string(from: date)
+    }
+
+    private func chargeText(_ pt: BatteryHistoryPoint) -> String {
+        if pt.isCharging == true { return "Charging" }
+        if pt.isACConnected == true { return "On power" }
+        if pt.isCharging == false && pt.isACConnected == false { return "On battery" }
+        return "–"
     }
 }
 
@@ -4848,8 +5086,16 @@ final class HistoryUIState: ObservableObject {
     @Published var showCyclesGraph: Bool = true
     @Published var showCapacityGraph: Bool = true
     @Published var aggregateDaily: Bool = true
+    @Published var selectedSnapshotDayKey: String? = nil
+    var snapshotCacheKey: String = ""
+    var snapshotRows: [BatteryHistoryPoint] = []
+    var snapshotsByDay: [String: [BatteryHistoryPoint]] = [:]
+    var historyStamp: String = ""
+    var historyBuckets: [String: [BatteryHistoryPoint]] = [:]
+    var dailyByDevice: [String: [BatteryHistoryPoint]] = [:]
+    var daysByDevice: [String: [String: [BatteryHistoryPoint]]] = [:]
     @Published var sortAscending: Bool = false
-    @Published var compareWithOldiPhone: Bool = false
+    @Published var compareDeviceId: String? = nil
     @Published var selectedGraphRange: BatteryHistoryChartView.GraphRange = .all
     @Published var selectedTempSection: BatteryHistoryChartView.TempChartSection = .today
     @Published var selectedCustomDateKey: String? = nil
@@ -4921,80 +5167,58 @@ struct BatteryHistoryChartView: View {
     private var showCyclesGraph: Bool { get { ui.showCyclesGraph } nonmutating set { ui.showCyclesGraph = newValue } }
     private var showCapacityGraph: Bool { get { ui.showCapacityGraph } nonmutating set { ui.showCapacityGraph = newValue } }
     private var aggregateDaily: Bool { get { ui.aggregateDaily } nonmutating set { ui.aggregateDaily = newValue } }
+    private var selectedSnapshotDayKey: String? { get { ui.selectedSnapshotDayKey } nonmutating set { ui.selectedSnapshotDayKey = newValue } }
     private var sortAscending: Bool { get { ui.sortAscending } nonmutating set { ui.sortAscending = newValue } }
-    private var compareWithOldiPhone: Bool { get { ui.compareWithOldiPhone } nonmutating set { ui.compareWithOldiPhone = newValue } }
+    private var compareDeviceId: String? { get { ui.compareDeviceId } nonmutating set { ui.compareDeviceId = newValue } }
     private var selectedGraphRange: GraphRange { get { ui.selectedGraphRange } nonmutating set { ui.selectedGraphRange = newValue } }
     private var selectedTempSection: TempChartSection { get { ui.selectedTempSection } nonmutating set { ui.selectedTempSection = newValue } }
     private var selectedCustomDateKey: String? { get { ui.selectedCustomDateKey } nonmutating set { ui.selectedCustomDateKey = newValue } }
     private var selectedLidSection: LidSessionSection { get { ui.selectedLidSection } nonmutating set { ui.selectedLidSection = newValue } }
 
     private var historyDevices: [DeviceBatteryData] {
-        var list: [DeviceBatteryData] = []
-        
-        // 1. All live / online devices (strictly 1 Mac and 1 iPhone 17 Pro)
-        for dev in vm.devices {
-            let canonName = canonicalDeviceDisplayName(name: dev.deviceName, model: dev.hardwareModel, deviceId: dev.deviceId, deviceType: dev.deviceType)
-            var normalizedDev = dev
-            normalizedDev.deviceName = canonName
+        var mac: DeviceBatteryData?
+        var phones: [String: DeviceBatteryData] = [:]
 
-            let isPhone17 = dev.deviceType != .mac && !dev.deviceId.contains("26cc71869") && !dev.deviceName.contains("15")
-            let isMac = dev.deviceType == .mac || dev.deviceId == "local_mac"
-            
-            if isMac {
-                if !list.contains(where: { $0.deviceType == .mac || $0.deviceId == "local_mac" }) {
-                    list.append(normalizedDev)
-                }
-            } else if isPhone17 {
-                if !list.contains(where: { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") && !$0.deviceName.contains("15") }) {
-                    list.append(normalizedDev)
-                }
-            } else if !list.contains(where: { $0.id == dev.id || $0.deviceId == dev.deviceId }) {
-                list.append(normalizedDev)
+        func absorb(_ dev: DeviceBatteryData) {
+            if dev.deviceType == .mac || dev.deviceId == "local_mac" {
+                if mac == nil || dev.isConnected { mac = dev }
+                return
+            }
+            let key = phoneGroupKey(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel)
+            var named = dev
+            named.deviceName = canonicalDeviceDisplayName(name: dev.deviceName, model: dev.hardwareModel, deviceId: dev.deviceId, deviceType: dev.deviceType)
+            if let existing = phones[key] {
+                if named.isConnected && !existing.isConnected { phones[key] = named }
+            } else {
+                phones[key] = named
             }
         }
-        
-        // 2. Discover any additional offline devices (e.g. Old iPhone 15) from real history snapshots
-        let hasPhone17 = list.contains(where: { $0.deviceType != .mac && !$0.deviceId.contains("26cc71869") && !$0.deviceName.contains("15") })
-        let distinctHistoryIds = Set(vm.historyPoints.map { $0.deviceId })
-        
-        for devId in distinctHistoryIds {
-            let pts = vm.historyPoints.filter { $0.deviceId == devId }.sorted(by: { $0.date < $1.date })
-            guard let lastPt = pts.last else { continue }
-            let devType = lastPt.deviceType ?? (lastPt.deviceId == "local_mac" ? .mac : .iphone)
-            let isPhone17 = devType != .mac && !lastPt.deviceId.contains("26cc71869") && !(lastPt.deviceName?.contains("15") ?? false)
-            let isMac = devType == .mac || lastPt.deviceId == "local_mac"
-            
-            if isMac && list.contains(where: { $0.deviceType == .mac || $0.deviceId == "local_mac" }) {
-                continue
-            }
-            if isPhone17 && hasPhone17 {
-                continue
-            }
-            if list.contains(where: { $0.deviceId == devId }) {
-                continue
-            }
-            
+
+        ensureHistoryIndex()
+        for dev in vm.devices { absorb(dev) }
+
+        for (key, pts) in ui.historyBuckets where key != "local_mac" && phones[key] == nil {
+            guard let lastPt = pts.max(by: { $0.date < $1.date }) else { continue }
+            let devType = lastPt.deviceType ?? .iphone
             let cap = lastPt.batteryPct
             let fcc = lastPt.fullChargeMah
-            let remMah = (fcc != nil) ? Int((cap / 100.0) * Double(fcc!)) : lastPt.capacityMah
-            let canonName = canonicalDeviceDisplayName(name: lastPt.deviceName, model: lastPt.deviceModel, deviceId: lastPt.deviceId, deviceType: devType)
-            
-            list.append(DeviceBatteryData(
+            let remMah = fcc.map { Int((cap / 100.0) * Double($0)) } ?? lastPt.capacityMah
+            phones[key] = DeviceBatteryData(
                 deviceId: lastPt.deviceId,
-                deviceName: canonName,
+                deviceName: canonicalDeviceDisplayName(name: lastPt.deviceName, model: lastPt.deviceModel, deviceId: lastPt.deviceId, deviceType: devType),
                 deviceType: devType,
                 isConnected: false,
                 isWirelesslyConnected: false,
                 capacityInt: Int(cap),
                 capacityExact: cap,
-                isCharging: lastPt.isCharging ?? false,
+                isCharging: false,
                 isFullyCharged: cap >= 100.0,
-                isACConnected: lastPt.isACConnected ?? (devType == .mac),
+                isACConnected: false,
                 cycleCount: lastPt.cycleCount,
                 batteryHealthPct: lastPt.healthPct,
                 voltageMv: nil,
                 amperageMa: 0,
-                chargingWatts: lastPt.chargingWatts,
+                chargingWatts: nil,
                 ratePctPerHour: nil,
                 temperatureC: lastPt.temperatureC,
                 timeRemainingMins: nil,
@@ -5012,9 +5236,27 @@ struct BatteryHistoryChartView: View {
                 hardwareModel: lastPt.deviceModel,
                 serialNumber: lastPt.deviceSerial ?? lastPt.deviceId,
                 fetchedAt: lastPt.date
-            ))
+            )
         }
+
+        let liveKeys = Set(vm.devices.filter { $0.deviceType != .mac && $0.deviceId != "local_mac" }.map {
+            phoneGroupKey(deviceId: $0.deviceId, serial: $0.serialNumber, name: $0.deviceName, model: $0.hardwareModel)
+        })
+        let current = phones.first(where: { $0.value.isConnected && liveKeys.contains($0.key) })?.value
+            ?? phones.first(where: { liveKeys.contains($0.key) })?.value
+
+        var list: [DeviceBatteryData] = []
+        if let mac { list.append(mac) }
+        if let current { list.append(current) }
+        let retired = phones.values
+            .filter { $0.deviceId != current?.deviceId }
+            .sorted { $0.deviceName < $1.deviceName }
+        list.append(contentsOf: retired)
         return list
+    }
+
+    private var currentPhoneId: String? {
+        historyDevices.first(where: { $0.deviceType != .mac })?.deviceId
     }
 
     private var activeDevice: DeviceBatteryData? {
@@ -5026,22 +5268,39 @@ struct BatteryHistoryChartView: View {
     }
 
     private func pointsFor(_ dev: DeviceBatteryData) -> [BatteryHistoryPoint] {
-        if dev.deviceType == .mac || dev.deviceId == "local_mac" {
-            return vm.historyPoints.filter { pt in
-                pt.deviceId == "local_mac" || pt.deviceType == .mac || (pt.deviceModel?.lowercased().contains("mac") ?? false)
-            }
-        } else if dev.deviceId.contains("26cc71869") || dev.deviceName.contains("15") {
-            // iPhone 15 (Old)
-            return vm.historyPoints.filter { pt in
-                pt.deviceId.contains("26cc71869") || (pt.deviceName?.contains("15") ?? false)
-            }
-        } else {
-            // iPhone 17 Pro
-            return vm.historyPoints.filter { pt in
-                if pt.deviceType == .mac || pt.deviceId == "local_mac" { return false }
-                if pt.deviceId.contains("26cc71869") || (pt.deviceName?.contains("15") ?? false) { return false }
-                return true
-            }
+        ensureHistoryIndex()
+        let key = phoneGroupKey(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel)
+        return ui.historyBuckets[key] ?? []
+    }
+
+    /// One pass over the archive. Switching Mac and iPhone only reads the bucket that is already built.
+    private func ensureHistoryIndex() {
+        let last = vm.historyPoints.last?.date.timeIntervalSinceReferenceDate ?? 0
+        let stamp = "\(vm.historyPoints.count)|\(Int(last))"
+        if ui.historyStamp == stamp { return }
+        var buckets: [String: [BatteryHistoryPoint]] = [:]
+        var days: [String: [String: [BatteryHistoryPoint]]] = [:]
+        for pt in vm.historyPoints {
+            let key = phoneGroupKey(deviceId: pt.deviceId, serial: pt.deviceSerial, name: pt.deviceName, model: pt.deviceModel)
+            buckets[key, default: []].append(pt)
+            days[key, default: [:]][snapshotDayKey(pt.date), default: []].append(pt)
+        }
+        var daily: [String: [BatteryHistoryPoint]] = [:]
+        for (key, byDay) in days {
+            daily[key] = dailyRows(from: byDay).sorted { $0.date > $1.date }
+        }
+        ui.historyBuckets = buckets
+        ui.daysByDevice = days
+        ui.dailyByDevice = daily
+        ui.historyStamp = stamp
+        ui.snapshotCacheKey = ""
+    }
+
+    private var comparablePhones: [DeviceBatteryData] {
+        guard let active = activeDevice, active.deviceType != .mac else { return [] }
+        let activeKey = phoneGroupKey(deviceId: active.deviceId, serial: active.serialNumber, name: active.deviceName, model: active.hardwareModel)
+        return historyDevices.filter { dev in
+            dev.deviceType != .mac && phoneGroupKey(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel) != activeKey
         }
     }
 
@@ -5123,10 +5382,71 @@ struct BatteryHistoryChartView: View {
     }
 
     private var displayedPoints: [BatteryHistoryPoint] {
-        let base = aggregateDaily ? dailyAveragedPoints : matchedPoints
-        return sortAscending
-            ? base.sorted(by: { $0.date < $1.date })
-            : base.sorted(by: { $0.date > $1.date })
+        ensureSnapshotCache()
+        return ui.snapshotRows
+    }
+
+    /// Rebuild the table only when the device, sort, or history actually changes. Hover must not land here.
+    private func ensureSnapshotCache() {
+        ensureHistoryIndex()
+        let devKey = activeDevice.map {
+            phoneGroupKey(deviceId: $0.deviceId, serial: $0.serialNumber, name: $0.deviceName, model: $0.hardwareModel)
+        } ?? ""
+        let key = "\(devKey)|\(aggregateDaily)|\(sortAscending)|\(ui.historyStamp)"
+        if ui.snapshotCacheKey == key { return }
+        let rows = aggregateDaily ? (ui.dailyByDevice[devKey] ?? []) : (ui.historyBuckets[devKey] ?? [])
+        ui.snapshotRows = sortAscending ? rows.sorted { $0.date < $1.date } : rows.sorted { $0.date > $1.date }
+        ui.snapshotsByDay = ui.daysByDevice[devKey] ?? [:]
+        ui.snapshotCacheKey = key
+    }
+
+    private func dailyRows(from byDay: [String: [BatteryHistoryPoint]]) -> [BatteryHistoryPoint] {
+        byDay.values.compactMap { pts in
+            guard let first = pts.first else { return nil }
+            if pts.count == 1 { return first }
+            let healths = pts.compactMap(\.healthPct)
+            let cycles = pts.compactMap(\.cycleCount)
+            let caps = pts.compactMap(\.fullChargeMah)
+            let temps = pts.compactMap(\.temperatureC)
+            let latest = pts.max(by: { $0.date < $1.date }) ?? first
+            return BatteryHistoryPoint(
+                deviceId: first.deviceId,
+                deviceName: first.deviceName,
+                deviceType: first.deviceType,
+                date: latest.date,
+                batteryPct: latest.batteryPct,
+                healthPct: healths.isEmpty ? first.healthPct : healths.reduce(0, +) / Double(healths.count),
+                cycleCount: cycles.max() ?? first.cycleCount,
+                capacityMah: caps.isEmpty ? first.fullChargeMah : Int(Double(caps.reduce(0, +)) / Double(caps.count)),
+                fullChargeMah: caps.isEmpty ? first.fullChargeMah : Int(Double(caps.reduce(0, +)) / Double(caps.count)),
+                designCapacityMah: first.designCapacityMah,
+                temperatureC: temps.isEmpty ? first.temperatureC : temps.reduce(0, +) / Double(temps.count),
+                batteryManufactureDate: first.batteryManufactureDate,
+                deviceManufactureDate: first.deviceManufactureDate,
+                firstUseDate: first.firstUseDate,
+                isCharging: latest.isCharging,
+                isACConnected: latest.isACConnected,
+                chargingWatts: latest.chargingWatts,
+                deviceModel: first.deviceModel,
+                osVersion: latest.osVersion,
+                appVersion: latest.appVersion,
+                batterySerial: first.batterySerial,
+                deviceSerial: first.deviceSerial
+            )
+        }
+    }
+
+    private func snapshotDayKey(_ date: Date) -> String {
+        let cal = Calendar.current
+        return String(format: "%04d-%02d-%02d",
+                      cal.component(.year, from: date),
+                      cal.component(.month, from: date),
+                      cal.component(.day, from: date))
+    }
+
+    private func rawSnapshots(on date: Date) -> [BatteryHistoryPoint] {
+        ensureSnapshotCache()
+        return ui.snapshotsByDay[snapshotDayKey(date)] ?? []
     }
 
     private var graphRangeStart: Date? {
@@ -5138,6 +5458,43 @@ struct BatteryHistoryChartView: View {
         let sorted = matchedPoints.sorted(by: { $0.date < $1.date })
         guard let start = graphRangeStart else { return sorted }
         return sorted.filter { $0.date >= start }
+    }
+
+    /// Month buttons describe the current iPhone. The retired phone is drawn at those same cycle numbers.
+    private func overlaySeries(for other: DeviceBatteryData) -> (current: [BatteryHistoryPoint], retired: [BatteryHistoryPoint]) {
+        let phone = historyDevices.first { $0.deviceType != .mac && $0.deviceId == currentPhoneId }
+        let currentAll = (phone.map { pointsFor($0) } ?? []).sorted { $0.date < $1.date }
+        let retiredAll = pointsFor(other)
+        guard let months = selectedGraphRange.months else { return (currentAll, retiredAll) }
+        let current = points(inLastMonths: months, of: currentAll)
+        let cycles = current.compactMap(\.cycleCount)
+        guard let lo = cycles.min(), let hi = cycles.max() else { return (current, []) }
+        let retired = retiredAll.filter { pt in
+            guard let cycle = pt.cycleCount else { return false }
+            return cycle >= lo && cycle <= hi
+        }
+        return (current, retired)
+    }
+
+    /// Use the phone's own latest reading as the end, so a retired phone is not compared against today.
+    private func points(inLastMonths months: Int, of samples: [BatteryHistoryPoint]) -> [BatteryHistoryPoint] {
+        guard let latest = samples.map(\.date).max() else { return [] }
+        let end = min(latest, Date())
+        guard let start = Calendar.current.date(byAdding: .month, value: -months, to: end) else { return samples }
+        let window = samples.filter { $0.date >= start && $0.date <= end.addingTimeInterval(60) }
+        return window.isEmpty ? samples : window
+    }
+
+    private func graphSubtitle(for dev: DeviceBatteryData) -> String {
+        let range = selectedGraphRange == .all ? "Complete trajectory" : selectedGraphRange.rawValue
+        guard let other = comparablePhones.first(where: { $0.deviceId == compareDeviceId }) else {
+            return "\(range) for \(dev.deviceName) from \(graphPoints.count) data points"
+        }
+        let cycles = overlaySeries(for: other).current.compactMap(\.cycleCount)
+        if let lo = cycles.min(), let hi = cycles.max(), selectedGraphRange != .all {
+            return "\(selectedGraphRange.rawValue) · cycles \(lo)–\(hi) · \(dev.deviceName) vs \(other.deviceName)"
+        }
+        return "\(range) · \(dev.deviceName) vs \(other.deviceName)"
     }
 
     private var deviceHistoryPoints: [BatteryHistoryPoint] {
@@ -5316,9 +5673,11 @@ struct BatteryHistoryChartView: View {
             // ── Device Switcher & Segments ──
             HStack {
                 // Device Segments
+                ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(historyDevices) { dev in
                         let count = pointsFor(dev).count
+                        let isRetired = dev.deviceType != .mac && dev.deviceId != currentPhoneId
 
                         Button(action: { selectedDevId = dev.id }) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -5333,9 +5692,9 @@ struct BatteryHistoryChartView: View {
                                         .fixedSize(horizontal: true, vertical: false)
                                 }
                                 
-                                Text("\(count) points")
+                                Text(isRetired ? "Retired · \(count)" : "\(count) points")
                                     .font(.system(size: 9, weight: .medium, design: .monospaced))
-                                    .foregroundColor(selectedDevId == dev.id ? .white.opacity(0.85) : .white.opacity(0.45))
+                                    .foregroundColor(isRetired ? Color(hex: "#CB64F4") : (selectedDevId == dev.id ? .white.opacity(0.85) : .white.opacity(0.45)))
                                     .padding(.leading, 15)
                             }
                             .padding(.horizontal, 10)
@@ -5353,6 +5712,8 @@ struct BatteryHistoryChartView: View {
                         .buttonStyle(.plain)
                     }
                 }
+                }
+                .frame(maxWidth: 420)
 
                 Spacer()
 
@@ -5481,13 +5842,18 @@ struct BatteryHistoryChartView: View {
 
     private var modernDataTableSubheader: some View {
         HStack {
-            Text(aggregateDaily ? "Showing \(displayedPoints.count) daily averaged snapshots (1 per day)" : "Showing all \(allMatchedSorted.count) raw snapshots")
+            Text(aggregateDaily ? "Showing \(displayedPoints.count) days. Click a day for every reading." : "Showing all \(allMatchedSorted.count) raw snapshots")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundColor(.white.opacity(0.5))
             
             Spacer()
 
-            Button(action: { withAnimation(.easeInOut(duration: 0.2)) { aggregateDaily.toggle() } }) {
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    aggregateDaily.toggle()
+                    selectedSnapshotDayKey = nil
+                }
+            }) {
                 HStack(spacing: 5) {
                     Image(systemName: aggregateDaily ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 10, weight: .bold))
@@ -5577,20 +5943,28 @@ struct BatteryHistoryChartView: View {
     }
 
     private var modernDataTableContent: some View {
-        ScrollView([.vertical, .horizontal], showsIndicators: true) {
+        ScrollView(.vertical, showsIndicators: true) {
             LazyVStack(spacing: 0) {
+                let _ = activeDevice?.deviceId
                 ForEach(Array(displayedPoints.enumerated()), id: \.element.id) { index, pt in
-                    ModernDataTableRowView(
-                        index: index,
-                        pt: pt,
-                        isHovered: hoveredRowIndex == index,
-                        activeDeviceModel: activeDevice?.hardwareModel,
-                        activeDeviceName: activeDevice?.deviceName,
-                        onHover: { hover in
-                            if hover { hoveredRowIndex = index }
-                            else if hoveredRowIndex == index { hoveredRowIndex = nil }
+                    let dayKey = snapshotDayKey(pt.date)
+                    let isOpen = aggregateDaily && selectedSnapshotDayKey == dayKey
+                    VStack(spacing: 0) {
+                        ModernDataTableRowView(
+                            index: index,
+                            pt: pt,
+                            isSelected: isOpen,
+                            activeDeviceModel: activeDevice?.hardwareModel,
+                            activeDeviceName: activeDevice?.deviceName
+                        )
+                        .onTapGesture {
+                            guard aggregateDaily else { return }
+                            selectedSnapshotDayKey = isOpen ? nil : dayKey
                         }
-                    )
+                        if isOpen {
+                            SnapshotDayDetail(points: rawSnapshots(on: pt.date))
+                        }
+                    }
                 }
             }
         }
@@ -5994,17 +6368,21 @@ struct BatteryHistoryChartView: View {
                 graphRangePills
 
                 // Degradation Canvas (Uses all matched snapshots + baseline for rich continuous trajectory)
-                let comparisonList: [BatteryHistoryPoint] = (compareWithOldiPhone && (activeDevice?.deviceName.contains("17") == true || activeDevice?.hardwareModel?.contains("17") == true)) ? vm.historyPoints.filter { $0.deviceId.contains("26cc71869") || ($0.deviceName?.contains("15") ?? false) } : []
+                let compareDev = comparablePhones.first { $0.deviceId == compareDeviceId }
+                let overlay = compareDev.map { overlaySeries(for: $0) }
+                let comparisonList = overlay?.retired ?? []
+                let plottedPoints = overlay?.current ?? graphPoints
                 BatteryDegradationGraphCanvas(
-                    points: graphPoints,
+                    points: plottedPoints,
                     showHealth: showHealthGraph,
                     showCycles: showCyclesGraph,
                     showCapacity: showCapacityGraph,
                     designCapacity: activeDevice?.designCapacityMah.map { Double($0) },
                     comparisonPoints: comparisonList,
-                    comparisonLabel: "iPhone 15",
-                    fixedMinTime: graphRangeStart?.timeIntervalSince1970,
-                    fixedMaxTime: graphRangeStart == nil ? nil : Date().timeIntervalSince1970
+                    comparisonLabel: compareDev?.deviceName ?? "Retired",
+                    alignByCycles: compareDev != nil,
+                    fixedMinTime: compareDev == nil ? graphRangeStart?.timeIntervalSince1970 : nil,
+                    fixedMaxTime: (compareDev != nil || graphRangeStart == nil) ? nil : Date().timeIntervalSince1970
                 )
                 .frame(height: 170)
                 .background(Color.black.opacity(0.3).cornerRadius(10))
@@ -6028,7 +6406,7 @@ struct BatteryHistoryChartView: View {
                     .font(.system(size: 13, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
                 if let dev = activeDevice {
-                    Text("\(selectedGraphRange == .all ? "Complete trajectory" : selectedGraphRange.rawValue) for \(dev.deviceName) from \(graphPoints.count) data points")
+                    Text(graphSubtitle(for: dev))
                         .font(.system(size: 10))
                         .foregroundColor(.white.opacity(0.5))
                 }
@@ -6109,17 +6487,22 @@ struct BatteryHistoryChartView: View {
             }
             .buttonStyle(.plain)
 
-            if activeDevice?.deviceName.contains("17") == true || activeDevice?.hardwareModel?.contains("17") == true {
-                Button(action: { withAnimation(.easeInOut(duration: 0.2)) { compareWithOldiPhone.toggle() } }) {
+            ForEach(comparablePhones) { other in
+                let isOn = compareDeviceId == other.deviceId
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        compareDeviceId = isOn ? nil : other.deviceId
+                    }
+                }) {
                     HStack(spacing: 4) {
                         Circle().fill(Color(hex: "#CB64F4")).frame(width: 6, height: 6)
-                        Text("Overlay iPhone 15")
+                        Text("Overlay \(other.deviceName)")
                             .font(.system(size: 10.5, weight: .semibold))
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
-                    .background(compareWithOldiPhone ? Color(hex: "#CB64F4").opacity(0.25) : Color.white.opacity(0.05))
-                    .foregroundColor(compareWithOldiPhone ? Color(hex: "#CB64F4") : .white.opacity(0.5))
+                    .background(isOn ? Color(hex: "#CB64F4").opacity(0.25) : Color.white.opacity(0.05))
+                    .foregroundColor(isOn ? Color(hex: "#CB64F4") : .white.opacity(0.5))
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -6347,9 +6730,9 @@ struct BatteryHistoryChartView: View {
 
         switch selectedLidSection {
         case .today:
-            return all.filter { cal.isDateInToday($0.openDate) }
+            return all.filter { MacLidTracker.isDateInCurrentLidDayCycle($0.openDate) }
         case .yesterday:
-            return all.filter { cal.isDateInYesterday($0.openDate) }
+            return all.filter { MacLidTracker.isDateInPreviousLidDayCycle($0.openDate) }
         case .last7:
             let start = cal.date(byAdding: .day, value: -7, to: now) ?? now
             return all.filter { $0.openDate >= start }
@@ -7560,7 +7943,7 @@ private final class LidPopoverState: ObservableObject {
 
 @MainActor
 struct DeviceGridCardView: View {
-    var vm: BatteryWidgetViewModel? = nil
+    @ObservedObject var vm: BatteryWidgetViewModel
     let dev: DeviceBatteryData
     let onSelect: () -> Void
     @StateObject private var popoverState = LidPopoverState()
@@ -7937,7 +8320,7 @@ struct DeviceGridCardView: View {
 
     @ViewBuilder
     private var lidOpenRow: some View {
-        if (dev.deviceType == .mac || dev.deviceId == "local_mac"), let firstOpen = vm?.firstLidOpenToday {
+        if (dev.deviceType == .mac || dev.deviceId == "local_mac"), let firstOpen = vm.firstLidOpenToday {
             Button(action: {
                 popoverState.showing = true
             }) {
@@ -7964,9 +8347,7 @@ struct DeviceGridCardView: View {
             }
             .buttonStyle(.plain)
             .popover(isPresented: $popoverState.showing, arrowEdge: .trailing) {
-                if let v = vm {
-                    LidSessionsPopoverView(vm: v)
-                }
+                LidSessionsPopoverView(vm: vm)
             }
         }
     }
