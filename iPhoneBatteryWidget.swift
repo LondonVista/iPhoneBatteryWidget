@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.17"
+    static let appVersion = "1.0.18"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -186,6 +186,9 @@ func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: S
     }
     
     if let m = model, !m.isEmpty {
+        if m.contains("19,2") || m.contains("19,") || m.lowercased().contains("18 pro") {
+            return "J. iPhone 18 Pro"
+        }
         if m.contains("18,1") || m.lowercased().contains("17 pro") {
             return "J. iPhone 17 Pro"
         }
@@ -204,7 +207,7 @@ func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: S
     if deviceType == .ipad {
         return "iPad"
     }
-    return "J. iPhone 17 Pro"
+    return "iPhone"
 }
 
 /// Same physical phone, including the UDID and serial aliases already in the archive.
@@ -218,18 +221,55 @@ func phoneGroupKey(deviceId: String, serial: String? = nil, name: String? = nil,
     if blob.contains("redacted-id-c") || blob.contains("redacted-sn-c") || modelL.contains("iphone15,4") || nameL.contains("iphone 15") {
         return "iphone-15"
     }
-    if blob.contains("redacted-udid-a") || blob.contains("redacted-sn-a") || modelL == "iphone18,1" || nameL.contains("17 pro") || modelL.contains("17 pro") {
+    // Unique ids before names, so a label cannot pull another phone into the wrong archive.
+    if blob.contains("redacted-udid-a") || blob.contains("redacted-sn-a") {
         return "iphone-17-pro"
     }
-    if modelL.contains("iphone19,") || nameL.contains("18 pro") || modelL.contains("18 pro") {
+    if blob.contains("redacted-udid-b") || blob.contains("redacted-sn-b")
+        || modelL.contains("iphone19,") || nameL.contains("18 pro") || modelL.contains("18 pro") {
         return "iphone-18-pro"
     }
+    if modelL == "iphone18,1" || nameL.contains("17 pro") || modelL.contains("17 pro") {
+        return "iphone-17-pro"
+    }
     return id.isEmpty ? blob : id
+}
+
+/// Kept so older call sites still compile. UDID redacted-udid-b and serial redacted-sn-b are the real iPhone 18 Pro (iPhone19,2).
+func isPlaceholderPhone(deviceId: String, serial: String? = nil, batterySerial: String? = nil) -> Bool {
+    false
+}
+
+func isInventedPhone(_ dev: DeviceBatteryData) -> Bool {
+    false
+}
+
+/// Coconut imports stored every row as 100% with no temperature and no charge rate.
+func chargePercentIsMeasured(_ pt: BatteryHistoryPoint) -> Bool {
+    if pt.temperatureC != nil { return true }
+    if pt.isCharging == true || pt.chargingWatts != nil { return true }
+    if pt.batteryPct < 99.5 { return true }
+    return false
+}
+
+func droppingPlaceholderPhones(_ points: [BatteryHistoryPoint]) -> [BatteryHistoryPoint] {
+    points.filter {
+        !isPlaceholderPhone(deviceId: $0.deviceId, serial: $0.deviceSerial, batterySerial: $0.batterySerial)
+    }
+}
+
+/// A past phone whose log stays in the archive. A connected one is still shown live.
+func isArchivedPhone(deviceId: String, serial: String? = nil, name: String? = nil, model: String? = nil) -> Bool {
+    let key = phoneGroupKey(deviceId: deviceId, serial: serial, name: name, model: model)
+    return key == "iphone-15" || key == "iphone-17-pro"
 }
 
 func canonicalDeviceModelName(model: String?, name: String? = nil, deviceId: String? = nil, deviceType: DeviceType? = nil) -> String {
     if let m = model, !m.isEmpty {
         let lower = m.lowercased()
+        if lower.contains("19,2") || lower.contains("19,") || lower.contains("18 pro") {
+            return "iPhone19,2"
+        }
         if lower.contains("18,1") || lower.contains("17 pro") {
             return "iPhone18,1"
         }
@@ -244,10 +284,17 @@ func canonicalDeviceModelName(model: String?, name: String? = nil, deviceId: Str
     if deviceId == "local_mac" || deviceType == .mac || (name?.lowercased().contains("mac") ?? false) {
         return "MacBookAir10,1"
     }
-    if (deviceId?.contains("redacted-id-c") ?? false) || (name?.contains("15") ?? false) {
+    let blob = "\(deviceId ?? "") \(name ?? "")".lowercased()
+    if blob.contains("redacted-id-c") || blob.contains("iphone 15") || blob.contains("redacted-sn-c") {
         return "iPhone15,4"
     }
-    return "iPhone18,1"
+    if blob.contains("18 pro") || blob.contains("iphone19") {
+        return "iPhone19,2"
+    }
+    if blob.contains("00008150") || blob.contains("17 pro") || blob.contains("redacted-sn-a") {
+        return "iPhone18,1"
+    }
+    return "iPhone"
 }
 
 func cleanDeviceDisplayName(_ raw: String?, fallback: String = "iPhone") -> String {
@@ -391,7 +438,12 @@ enum AppleModelDatabase {
             "iPhone19,2": (3582, 13.95), // iPhone 18 Pro
             "iPhone19,3": (3582, 13.95),
             "iPhone19,7": (3582, 13.95),
+            "iPhone 18 Pro": (3582, 13.95),
             "iPhone18,1": (3945, 15.2), // iPhone 17 Pro
+            "iPhone 17 Pro": (3945, 15.2),
+            "MacBookAir10,1": (4382, 49.9),
+            "MacBook Air (M1, 2020)": (4382, 49.9),
+            "MacBook Air": (4382, 49.9),
             "iPhone18,2": (4850, 18.8), // iPhone 17 Pro Max
             "iPhone18,3": (3650, 14.2), // iPhone 17
             "iPhone18,4": (3150, 12.1), // iPhone 17 Air
@@ -415,8 +467,14 @@ enum AppleModelDatabase {
             "iPhone13,4": (3687, 14.1)  // iPhone 12 Pro Max
         ]
         if let found = specs[clean] { return found }
-        if clean.lowercased().contains("ipad") { return (8000, 31.0) }
-        if clean.lowercased().contains("mac") { return (6000, 70.0) }
+        let lower = clean.lowercased()
+        if lower.contains("macbook air") || lower.contains("macbookair10") { return (4382, 49.9) }
+        if lower.contains("18 pro") || lower.contains("iphone19") { return (3582, 13.95) }
+        if lower.contains("17 pro max") || lower.contains("iphone18,2") { return (4850, 18.8) }
+        if lower.contains("17 pro") || lower.contains("iphone18,1") { return (3945, 15.2) }
+        if lower.contains("iphone 17") || lower.contains("iphone18,3") { return (3650, 14.2) }
+        if lower.contains("ipad") { return (8000, 31.0) }
+        if lower.contains("mac") { return (6000, 70.0) }
         return (3500, 13.5)
     }
     
@@ -484,9 +542,10 @@ enum AppleModelDatabase {
     static func lookupProcessor(model: String?, deviceName: String?, deviceType: DeviceType) -> String? {
         let text = "\(model ?? "") \(deviceName ?? "")".lowercased()
         if text.contains("iphone19") || text.contains("18 pro") { return "Apple A20 Pro" }
-        if text.contains("iphone18,1") || text.contains("17 pro max") { return "Apple A19 Pro" }
-        if text.contains("iphone18") || text.contains("17 pro") { return "Apple A19 Pro" }
-        if text.contains("iphone 17") { return "Apple A19" }
+        if text.contains("iphone18,2") || text.contains("17 pro max") { return "Apple A19 Pro" }
+        if text.contains("iphone18,1") || text.contains("17 pro") { return "Apple A19 Pro" }
+        if text.contains("iphone18,3") || text.contains("iphone 17") { return "Apple A19" }
+        if text.contains("iphone18") { return "Apple A19 Pro" }
         if text.contains("iphone16,2") || text.contains("16 pro max") { return "Apple A18 Pro" }
         if text.contains("iphone16,1") || text.contains("16 pro") { return "Apple A18 Pro" }
         if text.contains("iphone16") || text.contains("16 plus") || text.contains("iphone 16") { return "Apple A18" }
@@ -590,6 +649,20 @@ struct DeviceBatteryData: Codable, Identifiable, Equatable {
     var adapterInWatts: Double? = nil
     /// Seconds since that device last rebooted.
     var uptimeSeconds: Int? = nil
+    /// Kept off the saved device cache. History copies them onto the snapshot.
+    var reportedOS: String? = nil
+    var packSerial: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case deviceId, deviceName, deviceType, isConnected, isWirelesslyConnected
+        case capacityInt, capacityExact, isCharging, isFullyCharged, isACConnected
+        case cycleCount, batteryHealthPct, voltageMv, amperageMa, chargingWatts
+        case ratePctPerHour, temperatureC, tempTrend, timeRemainingMins
+        case remainingMah, fullChargeMah, designCapacityMah, totalDiskBytes, freeDiskBytes
+        case batteryManufactureDate, deviceManufactureDate, firstUseDate, modelReleaseDate, lastSeenAt
+        case processor, hardwareModel, serialNumber, fetchedAt
+        case pdHandshakeOn, pdInputVoltageV, pdAdapterWatts, systemLoadWatts, adapterInWatts, uptimeSeconds
+    }
 
     /// Compare fields the UI actually shows. Ignores `fetchedAt` so a poll does not rebuild the widget.
     func liveEqual(_ o: DeviceBatteryData) -> Bool {
@@ -643,6 +716,7 @@ enum MacBatteryReader {
         var chipName: String
         var hwModelName: String
         var serialNum: String?
+        var battSerial: String?
         var hostName: String
         var modelRelDate: Date?
         var devMfgDate: Date?
@@ -824,7 +898,8 @@ enum MacBatteryReader {
                     battMfgDate = Calendar.current.date(from: comp)
                 }
             }
-            if battMfgDate == nil, let battSerial = asString(batt["Serial"]) ?? asString(batt["BatterySerialNumber"]) ?? asString(packData["Serial"]) {
+            let battSerial = asString(batt["Serial"]) ?? asString(batt["BatterySerialNumber"]) ?? asString(packData["Serial"])
+            if battMfgDate == nil, let battSerial {
                 battMfgDate = AppleModelDatabase.decodeBatterySerialDate(battSerial)
             }
 
@@ -846,6 +921,7 @@ enum MacBatteryReader {
                 chipName: chipName,
                 hwModelName: hwModelName,
                 serialNum: serialNum,
+                battSerial: battSerial,
                 hostName: hostName,
                 modelRelDate: modelRelDate,
                 devMfgDate: devMfgDate,
@@ -927,7 +1003,8 @@ enum MacBatteryReader {
             pdAdapterWatts: pdWatts,
             systemLoadWatts: systemLoadW,
             adapterInWatts: adapterInW,
-            uptimeSeconds: max(0, Int(Date().timeIntervalSince(ident.bootDate)))
+            uptimeSeconds: max(0, Int(Date().timeIntervalSince(ident.bootDate))),
+            packSerial: ident.battSerial
         )
     }
 }
@@ -980,6 +1057,19 @@ enum CoconutBatteryArchiveReader {
         return parseCoconutRecords(json)
     }
 
+    /// A real state-of-charge field, when coconut actually stored one.
+    private static func coconutPercent(_ r: [String: Any]) -> Double? {
+        let keys = [
+            "Battery.CurrentCharge", "Battery.ChargePercent", "Battery.Percent",
+            "Data.CurrentCharge", "Data.ChargePercent", "Battery.StateOfCharge"
+        ]
+        for key in keys {
+            guard let raw = (r[key] as? NSNumber)?.doubleValue, raw >= 0, raw <= 100 else { continue }
+            return raw
+        }
+        return nil
+    }
+
     static func parseCoconutRecords(_ records: [[String: Any]]) -> [BatteryHistoryPoint] {
         var points: [BatteryHistoryPoint] = []
         for r in records {
@@ -1026,10 +1116,10 @@ enum CoconutBatteryArchiveReader {
 
             points.append(BatteryHistoryPoint(
                 deviceId: devId,
-                deviceName: cleanDeviceDisplayName(devName, fallback: isMac ? "MacBook Air M1" : "iPhone 17 Pro"),
+                deviceName: cleanDeviceDisplayName(devName, fallback: isMac ? "MacBook Air M1" : "iPhone"),
                 deviceType: isMac ? .mac : .iphone,
                 date: Date(timeIntervalSince1970: ts),
-                batteryPct: 100.0,
+                batteryPct: coconutPercent(r) ?? 100.0,
                 healthPct: healthPct,
                 cycleCount: cycles,
                 capacityMah: actualFcc,
@@ -1584,6 +1674,7 @@ def run():
 
         res = {
             'udid': dev_udid,
+            'productVersion': base_info.get('ProductVersion'),
             'isNetwork': is_net,
             'deviceName': base_info.get('DeviceName', 'iPhone'),
             'productType': base_info.get('ProductType', 'iPhone'),
@@ -1623,6 +1714,7 @@ run()
             let isNetwork: Bool?
             let deviceName: String?
             let productType: String?
+            let productVersion: String?
             let serialNumber: String?
             let capacity: Int?
             let isCharging: Bool?
@@ -1675,7 +1767,7 @@ run()
             deviceName: canonicalDeviceDisplayName(name: info.deviceName, model: hwMarketing, deviceId: info.udid ?? udid, deviceType: dType),
             deviceType: dType,
             isConnected: true,
-            isWirelesslyConnected: info.isNetwork ?? true,
+            isWirelesslyConnected: info.isNetwork ?? false,
             capacityInt: cap,
             capacityExact: Double(cap),
             isCharging: info.isCharging ?? false,
@@ -1703,7 +1795,9 @@ run()
             hardwareModel: hwMarketing,
             serialNumber: info.serialNumber,
             fetchedAt: Date(),
-            uptimeSeconds: info.uptimeSeconds
+            uptimeSeconds: info.uptimeSeconds,
+            reportedOS: info.productVersion,
+            packSerial: info.batterySerialNumber
         )
     }
 
@@ -1810,6 +1904,7 @@ run()
         var deviceName = "iPhone"
         var deviceType: DeviceType = .iphone
         var serial: String? = nil
+        var productVersion: String? = nil
         var totalDisk: Int64? = nil
         var freeDisk: Int64? = nil
         var hardwareModelName: String? = nil
@@ -1817,6 +1912,7 @@ run()
         
         if let baseRaw = run(infoTool, args: udidArgs, timeout: timeoutSec) {
             let baseDict = parseKV(baseRaw)
+            if let v = baseDict["ProductVersion"], !v.isEmpty { productVersion = v }
             if let n = baseDict["DeviceName"], !n.isEmpty { deviceName = cleanDeviceDisplayName(n, fallback: "iPhone") }
             if let p = baseDict["ProductType"] {
                 if p.lowercased().contains("ipad") { deviceType = .ipad }
@@ -1971,7 +2067,8 @@ run()
             processor: nil,
             hardwareModel: hardwareModelName ?? (deviceType == .ipad ? "iPad" : "iPhone"),
             serialNumber: serial,
-            fetchedAt: Date()
+            fetchedAt: Date(),
+            reportedOS: productVersion
         )
     }
 }
@@ -2341,12 +2438,19 @@ final class BatteryWidgetViewModel: ObservableObject {
     private func loadPersisted() {
         if let data = UserDefaults.standard.data(forKey: kCachedDevicesKey),
            let cached = try? JSONDecoder().decode([DeviceBatteryData].self, from: data) {
-            self.devices = cached.map { d in
+            let kept = cached.compactMap { d -> DeviceBatteryData? in
+                if isInventedPhone(d) { return nil }
                 var x = d
                 if x.deviceType != .mac && x.deviceId != "local_mac" {
                     x.uptimeSeconds = nil
                 }
                 return x
+            }
+            self.devices = kept
+            if kept.count != cached.count {
+                saveDevices()
+                UserDefaults.standard.removeObject(forKey: "ibw.lastKnowniPhonePct")
+                UserDefaults.standard.removeObject(forKey: "ibw.lastKnowniPhoneDate")
             }
         }
         let filePoints = CoconutBatteryArchiveReader.importHistoricalPoints()
@@ -2396,6 +2500,13 @@ final class BatteryWidgetViewModel: ObservableObject {
             self.historyPoints = combined
         } else {
             self.historyPoints = filePoints
+        }
+        let historyBefore = self.historyPoints.count
+        self.historyPoints = droppingPlaceholderPhones(self.historyPoints)
+        if self.historyPoints.count != historyBefore {
+            historyDirty = true
+            UserDefaults.standard.removeObject(forKey: "ibw.lastKnowniPhonePct")
+            UserDefaults.standard.removeObject(forKey: "ibw.lastKnowniPhoneDate")
         }
         if UserDefaults.standard.object(forKey: "batteryWidget.bgOpacity") != nil {
             let op = UserDefaults.standard.double(forKey: "batteryWidget.bgOpacity")
@@ -2468,7 +2579,7 @@ final class BatteryWidgetViewModel: ObservableObject {
             await MainActor.run {
                 var existingKeys = Set(self.historyPoints.map { "\($0.deviceId)_\(Int($0.date.timeIntervalSince1970))" })
                 var added = 0
-                for pt in imported {
+                for pt in imported where !isPlaceholderPhone(deviceId: pt.deviceId, serial: pt.deviceSerial, batterySerial: pt.batterySerial) {
                     let k = "\(pt.deviceId)_\(Int(pt.date.timeIntervalSince1970))"
                     if !existingKeys.contains(k) {
                         self.historyPoints.append(pt)
@@ -2478,7 +2589,7 @@ final class BatteryWidgetViewModel: ObservableObject {
                 }
                 if added > 0 {
                     self.historyPoints.sort(by: { $0.date < $1.date })
-                    self.savePersisted()
+                    self.commitHistoryEdits()
                 }
             }
         }
@@ -2490,8 +2601,12 @@ final class BatteryWidgetViewModel: ObservableObject {
     }
 
     private func saveDevices() {
-        if let data = try? JSONEncoder().encode(devices) {
+        let clean = devices.filter { !isInventedPhone($0) }
+        if let data = try? JSONEncoder().encode(clean) {
             UserDefaults.standard.set(data, forKey: kCachedDevicesKey)
+        }
+        if clean.count != devices.count {
+            devices = clean
         }
     }
 
@@ -2504,6 +2619,16 @@ final class BatteryWidgetViewModel: ObservableObject {
                 UserDefaults.standard.set(data, forKey: kHistoryLogKey)
             }
         }
+    }
+
+    /// Persist history edits, and keep the invented iPhone 18 Pro out of the log.
+    func commitHistoryEdits() {
+        let kept = droppingPlaceholderPhones(historyPoints)
+        if kept.count != historyPoints.count {
+            historyPoints = kept
+        }
+        historyDirty = true
+        saveHistory()
     }
 
     func selectTab(_ id: String) {
@@ -2561,6 +2686,49 @@ final class BatteryWidgetViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Last real reading, shown disconnected. No invented phone, no live charge state.
+    private func parkedPhone(from pt: BatteryHistoryPoint) -> DeviceBatteryData {
+        let devType = pt.deviceType ?? .iphone
+        let measured = chargePercentIsMeasured(pt)
+        let cap = pt.batteryPct
+        return DeviceBatteryData(
+            deviceId: pt.deviceId,
+            deviceName: canonicalDeviceDisplayName(name: pt.deviceName, model: pt.deviceModel, deviceId: pt.deviceId, deviceType: devType),
+            deviceType: devType,
+            isConnected: false,
+            isWirelesslyConnected: false,
+            capacityInt: Int(cap.rounded()),
+            capacityExact: cap,
+            isCharging: false,
+            isFullyCharged: measured && cap >= 99.5,
+            isACConnected: false,
+            cycleCount: pt.cycleCount,
+            batteryHealthPct: pt.healthPct,
+            voltageMv: nil,
+            amperageMa: 0,
+            chargingWatts: nil,
+            ratePctPerHour: nil,
+            temperatureC: pt.temperatureC,
+            timeRemainingMins: nil,
+            remainingMah: pt.fullChargeMah.map { Int((cap / 100.0) * Double($0)) } ?? pt.capacityMah,
+            fullChargeMah: pt.fullChargeMah,
+            designCapacityMah: pt.designCapacityMah,
+            totalDiskBytes: nil,
+            freeDiskBytes: nil,
+            batteryManufactureDate: pt.batteryManufactureDate,
+            deviceManufactureDate: pt.deviceManufactureDate,
+            firstUseDate: pt.firstUseDate,
+            modelReleaseDate: nil,
+            lastSeenAt: pt.date,
+            processor: AppleModelDatabase.lookupProcessor(model: pt.deviceModel, deviceName: pt.deviceName, deviceType: devType),
+            hardwareModel: pt.deviceModel,
+            serialNumber: pt.deviceSerial,
+            fetchedAt: pt.date,
+            reportedOS: pt.osVersion,
+            packSerial: pt.batterySerial
+        )
     }
 
     private func rebuildDevicesList() {
@@ -2630,77 +2798,54 @@ final class BatteryWidgetViewModel: ObservableObject {
         finalDevices.append(enrichedMac)
         self.recordHistory(enrichedMac)
 
-        // Prefer wired (non-wireless) connection first if multiple entries exist
-        let preferredOnlinePhone = self.lastIOSDevices
-            .filter { $0.deviceType != .mac && !$0.deviceId.contains("redacted-id-c") }
+        // Record history snapshots for any detected iOS device (preserving archived iPhone 17 Pro telemetry if seen)
+        for iosDev in self.lastIOSDevices where iosDev.deviceType != .mac {
+            self.recordHistory(iosDev)
+        }
+
+        // The daily phone wins when it is plugged in. A retired phone plugged in for a top-up
+        // is shown live instead, and its samples stay on that phone's existing archive.
+        let onlinePhones = self.lastIOSDevices
+            .filter { $0.deviceType != .mac && !isInventedPhone($0) }
             .sorted(by: { (!$0.isWirelesslyConnected ? 0 : 1) < (!$1.isWirelesslyConnected ? 0 : 1) })
-            .first
+        let preferredOnlinePhone = onlinePhones.first(where: {
+            !isArchivedPhone(deviceId: $0.deviceId, serial: $0.serialNumber, name: $0.deviceName, model: $0.hardwareModel)
+        }) ?? onlinePhones.first
 
         if let onlinePhone = preferredOnlinePhone {
             let enrichedPhone = self.enrichWithBatteryRate(onlinePhone)
             finalDevices.insert(enrichedPhone, at: 0)
-            self.recordHistory(onlinePhone)
-            UserDefaults.standard.set(onlinePhone.capacityExact, forKey: "ibw.lastKnowniPhonePct")
-            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "ibw.lastKnowniPhoneDate")
-        } else if var cachedPhone = updatedDevices.first(where: { $0.deviceType != .mac && !$0.deviceId.contains("redacted-id-c") && !$0.deviceName.contains("15") }) {
-            cachedPhone.uptimeSeconds = nil
+            let archivedTopUp = isArchivedPhone(deviceId: onlinePhone.deviceId, serial: onlinePhone.serialNumber, name: onlinePhone.deviceName, model: onlinePhone.hardwareModel)
+            if !archivedTopUp {
+                UserDefaults.standard.set(onlinePhone.capacityExact, forKey: "ibw.lastKnowniPhonePct")
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "ibw.lastKnowniPhoneDate")
+            }
+        } else if let cachedPhone = updatedDevices.first(where: {
+            $0.deviceType != .mac
+                && !isInventedPhone($0)
+                && !isArchivedPhone(deviceId: $0.deviceId, serial: $0.serialNumber, name: $0.deviceName, model: $0.hardwareModel)
+        }) ?? updatedDevices.first(where: {
+            $0.deviceType != .mac && !isInventedPhone($0)
+        }) {
             finalDevices.insert(cachedPhone, at: 0)
-        } else {
-            let last17 = historyPoints
-                .filter { pt in
-                    pt.deviceType != .mac && pt.deviceId != "local_mac" && !pt.deviceId.contains("redacted-id-c") && !(pt.deviceName?.contains("15") ?? false)
-                }
-                .max(by: { $0.date < $1.date })
-            let lastKnownPct: Double = {
-                let saved = UserDefaults.standard.double(forKey: "ibw.lastKnowniPhonePct")
-                if saved > 0.0 { return saved }
-                return 74.0
-            }()
-            let fcc = last17?.fullChargeMah ?? 3908
-            let remMah = Int((lastKnownPct / 100.0) * Double(fcc))
-            
-            let df = DateFormatter()
-            df.dateFormat = "yyyy-MM-dd"
-            let bDate = last17?.batteryManufactureDate ?? df.date(from: "2025-08-12")
-            let dDate = last17?.deviceManufactureDate ?? df.date(from: "2025-08-25")
-            let uDate = last17?.firstUseDate ?? df.date(from: "2025-09-20")
-            let rDate = df.date(from: "2025-09-09")
+        } else if let lastReal = historyPoints
+            .filter({
+                $0.deviceType != .mac && $0.deviceId != "local_mac"
+                    && !isPlaceholderPhone(deviceId: $0.deviceId, serial: $0.deviceSerial, batterySerial: $0.batterySerial)
+            })
+            .max(by: { $0.date < $1.date }) {
+            finalDevices.insert(parkedPhone(from: lastReal), at: 0)
+        }
 
-            let synthDev = DeviceBatteryData(
-                deviceId: last17?.deviceId ?? "redacted-sn-a",
-                deviceName: canonicalDeviceDisplayName(name: last17?.deviceName, model: last17?.deviceModel, deviceId: last17?.deviceId ?? "redacted-sn-a", deviceType: .iphone),
-                deviceType: .iphone,
-                isConnected: false,
-                isWirelesslyConnected: false,
-                capacityInt: Int(lastKnownPct),
-                capacityExact: lastKnownPct,
-                isCharging: false,
-                isFullyCharged: false,
-                isACConnected: false,
-                cycleCount: last17?.cycleCount ?? 174,
-                batteryHealthPct: last17?.healthPct ?? 100.0,
-                voltageMv: 4120,
-                amperageMa: 0,
-                chargingWatts: nil,
-                ratePctPerHour: nil,
-                temperatureC: last17?.temperatureC ?? 26.5,
-                timeRemainingMins: nil,
-                remainingMah: remMah,
-                fullChargeMah: fcc,
-                designCapacityMah: last17?.designCapacityMah ?? 3998,
-                totalDiskBytes: 512_000_000_000,
-                freeDiskBytes: 340_000_000_000,
-                batteryManufactureDate: bDate,
-                deviceManufactureDate: dDate,
-                firstUseDate: uDate,
-                modelReleaseDate: rDate,
-                lastSeenAt: last17?.date ?? Date(),
-                processor: "Apple A19 Pro",
-                hardwareModel: last17?.deviceModel ?? "iPhone18,1",
-                serialNumber: last17?.deviceSerial ?? "redacted-sn-a",
-                fetchedAt: Date()
-            )
-            finalDevices.insert(synthDev, at: 0)
+        finalDevices.removeAll { isInventedPhone($0) }
+        if !finalDevices.contains(where: { $0.deviceType != .mac }),
+           let lastReal = historyPoints
+            .filter({
+                $0.deviceType != .mac && $0.deviceId != "local_mac"
+                    && !isPlaceholderPhone(deviceId: $0.deviceId, serial: $0.deviceSerial, batterySerial: $0.batterySerial)
+            })
+            .max(by: { $0.date < $1.date }) {
+            finalDevices.insert(parkedPhone(from: lastReal), at: 0)
         }
 
         let unchanged = devices.count == finalDevices.count
@@ -2863,13 +3008,18 @@ final class BatteryWidgetViewModel: ObservableObject {
             pdAdapterWatts: dev.pdAdapterWatts,
             systemLoadWatts: dev.systemLoadWatts,
             adapterInWatts: dev.adapterInWatts,
-            uptimeSeconds: dev.uptimeSeconds
+            uptimeSeconds: dev.uptimeSeconds,
+            reportedOS: dev.reportedOS,
+            packSerial: dev.packSerial
         )
     }
 
     private func recordHistory(_ dev: DeviceBatteryData) {
-        // Record point if at least 180 seconds passed OR if charging status / temperature changed significantly
-        let recent = historyPoints.last(where: { $0.deviceId == dev.deviceId })
+        if isPlaceholderPhone(deviceId: dev.deviceId, serial: dev.serialNumber, batterySerial: dev.packSerial) { return }
+        let group = phoneGroupKey(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel)
+        let recent = historyPoints.last(where: {
+            phoneGroupKey(deviceId: $0.deviceId, serial: $0.deviceSerial, name: $0.deviceName, model: $0.deviceModel) == group
+        })
         let shouldRecord: Bool
         if let recent = recent {
             let elapsed = abs(recent.date.timeIntervalSinceNow)
@@ -2901,9 +3051,11 @@ final class BatteryWidgetViewModel: ObservableObject {
                 isACConnected: dev.isACConnected,
                 chargingWatts: dev.chargingWatts,
                 deviceModel: dev.hardwareModel,
-                osVersion: dev.deviceType == .mac ? "\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).\(ProcessInfo.processInfo.operatingSystemVersion.minorVersion)" : "27.0",
-                appVersion: "4.4.0",
-                batterySerial: dev.serialNumber,
+                osVersion: dev.deviceType == .mac
+                    ? "\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).\(ProcessInfo.processInfo.operatingSystemVersion.minorVersion)"
+                    : dev.reportedOS,
+                appVersion: iPhoneBatteryWidgetConfig.appVersion,
+                batterySerial: dev.packSerial,
                 deviceSerial: dev.serialNumber
             )
             historyPoints.append(pt)
@@ -2912,22 +3064,40 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
-    /// Drop the oldest samples from the busiest device. A retired phone's archive is never the first thing removed.
+    /// Keep every phone. The Mac gives up old samples first. The iPhone 15 archive is left alone.
     private func trimHistoryKeepingEveryPhone() {
-        let cap = 8000
+        let cap = 20000
+        let macFloor = 2500
         guard historyPoints.count > cap else { return }
         var pts = historyPoints.sorted(by: { $0.date < $1.date })
+        func group(_ pt: BatteryHistoryPoint) -> String {
+            phoneGroupKey(deviceId: pt.deviceId, serial: pt.deviceSerial, name: pt.deviceName, model: pt.deviceModel)
+        }
         while pts.count > cap {
             var counts: [String: Int] = [:]
             for pt in pts {
-                let key = phoneGroupKey(deviceId: pt.deviceId, serial: pt.deviceSerial, name: pt.deviceName, model: pt.deviceModel)
-                counts[key, default: 0] += 1
+                counts[group(pt), default: 0] += 1
             }
-            guard let fatKey = counts.max(by: { $0.value < $1.value })?.key,
-                  let idx = pts.firstIndex(where: {
-                      phoneGroupKey(deviceId: $0.deviceId, serial: $0.deviceSerial, name: $0.deviceName, model: $0.deviceModel) == fatKey
-                  }) else { break }
-            pts.remove(at: idx)
+            let macCount = counts["local_mac"] ?? 0
+            let fatKey: String?
+            if macCount > macFloor {
+                fatKey = "local_mac"
+            } else {
+                fatKey = counts.filter { $0.key != "iphone-15" }.max(by: { $0.value < $1.value })?.key
+            }
+            guard let fatKey else { break }
+            let floor = fatKey == "local_mac" ? macFloor : 1
+            let drop = min(pts.count - cap, (counts[fatKey] ?? 0) - floor)
+            if drop <= 0 { break }
+            var dropped = 0
+            pts.removeAll { pt in
+                if dropped >= drop { return false }
+                if group(pt) == fatKey {
+                    dropped += 1
+                    return true
+                }
+                return false
+            }
         }
         historyPoints = pts
     }
@@ -3010,8 +3180,8 @@ final class BatteryWidgetViewModel: ObservableObject {
             let detector = USBPortDetector { [weak self] _ in
                 Task.detached(priority: .userInitiated) {
                     let currentUDIDs = iDeviceReader.listConnectedUDIDs()
-                    let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") && !$0.udid.contains("redacted-id-c") }.map { $0.udid })
-                    let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") && !$0.udid.contains("redacted-id-c") }.map { $0.udid })
+                    let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") }.map { $0.udid })
+                    let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") }.map { $0.udid })
 
                     await MainActor.run { [weak self] in
                         self?.checkConnectionTransitions(wired: currentWired, all: currentAll, isHardwareEvent: true)
@@ -3027,8 +3197,8 @@ final class BatteryWidgetViewModel: ObservableObject {
         let t = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
             Task.detached(priority: .utility) {
                 let currentUDIDs = iDeviceReader.listConnectedUDIDs()
-                let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") && !$0.udid.contains("redacted-id-c") }.map { $0.udid })
-                let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") && !$0.udid.contains("redacted-id-c") }.map { $0.udid })
+                let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") }.map { $0.udid })
+                let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") }.map { $0.udid })
 
                 await MainActor.run { [weak self] in
                     self?.checkConnectionTransitions(wired: currentWired, all: currentAll, isHardwareEvent: false)
@@ -3151,6 +3321,7 @@ final class BatteryWidgetViewModel: ObservableObject {
         for dev in devices {
             // ONLY play 80% sound for iPhone / iPad, NEVER for Mac
             guard dev.deviceType != .mac && dev.deviceId != "local_mac" else { continue }
+            if isPlaceholderPhone(deviceId: dev.deviceId, serial: dev.serialNumber, batterySerial: dev.packSerial) { continue }
             
             let isChargingOrAC = dev.isCharging || (dev.isACConnected == true)
             if isChargingOrAC {
@@ -3231,7 +3402,8 @@ final class USBPortDetector {
     func start() {
         notifyPort = IONotificationPortCreate(kIOMainPortDefault)
         guard let notifyPort = notifyPort else { return }
-        let runLoopSource = IONotificationPortGetRunLoopSource(notifyPort).takeRetainedValue()
+        // Get returns an unowned source. The port keeps it alive; the run loop retains it on add.
+        let runLoopSource = IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue()
         CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -3995,7 +4167,7 @@ struct BatteryDegradationGraphCanvas: View {
     let showCapacity: Bool
     let designCapacity: Double?
     var comparisonPoints: [BatteryHistoryPoint] = []
-    var comparisonLabel: String = "iPhone 15"
+    var comparisonLabel: String = "iPhone 17 Pro"
     var alignByCycles: Bool = false
     var fixedMinTime: Double? = nil
     var fixedMaxTime: Double? = nil
@@ -4608,8 +4780,9 @@ struct DailyTemperatureGraphCanvas: View {
                                     .background(tipCol.opacity(0.85))
                                     .clipShape(Capsule())
                             }
-                            if let bPct = hPt.batteryPct as Double? {
-                                Text(String(format: "Battery: %.0f%% • %@", bPct, (hPt.isCharging == true ? "Charging" : "Discharging")))
+                            if chargePercentIsMeasured(hPt) {
+                                let state = hPt.isCharging == true ? "Charging" : (hPt.isCharging == false ? "Discharging" : "–")
+                                Text(String(format: "Battery: %.0f%% • %@", hPt.batteryPct, state))
                                     .font(.system(size: 8, weight: .medium))
                                     .foregroundColor(.white.opacity(0.5))
                             }
@@ -4869,10 +5042,15 @@ private struct SnapshotDayDetail: View {
     let points: [BatteryHistoryPoint]
 
     private var batterySpan: String {
-        let values = points.map(\.batteryPct)
+        let values = points.filter(chargePercentIsMeasured).map(\.batteryPct)
         guard let lo = values.min(), let hi = values.max() else { return "–" }
         if abs(hi - lo) < 0.05 { return String(format: "%.0f%%", hi) }
         return String(format: "%.0f–%.0f%%", lo, hi)
+    }
+
+    private func percentText(_ pt: BatteryHistoryPoint) -> String {
+        guard chargePercentIsMeasured(pt) else { return "–" }
+        return String(format: "%.0f%%", pt.batteryPct)
     }
 
     /// One row per clock hour: the last snapshot taken during that hour.
@@ -4903,7 +5081,7 @@ private struct SnapshotDayDetail: View {
                         HStack(spacing: 10) {
                             Text(timeText(pt.date))
                                 .frame(width: 52, alignment: .leading)
-                            Text(String(format: "%.0f%%", pt.batteryPct))
+                            Text(percentText(pt))
                                 .frame(width: 40, alignment: .leading)
                             Text(chargeText(pt))
                                 .frame(width: 78, alignment: .leading)
@@ -5120,6 +5298,7 @@ struct BatteryHistoryChartView: View {
     }
 
     enum GraphRange: String, CaseIterable {
+        case fewDays = "3 Days"
         case oneMonth = "1 Month"
         case threeMonths = "3 Months"
         case sixMonths = "6 Months"
@@ -5128,12 +5307,17 @@ struct BatteryHistoryChartView: View {
 
         var months: Int? {
             switch self {
+            case .fewDays: return nil
             case .oneMonth: return 1
             case .threeMonths: return 3
             case .sixMonths: return 6
             case .twelveMonths: return 12
             case .all: return nil
             }
+        }
+
+        var days: Int? {
+            self == .fewDays ? 3 : nil
         }
     }
 
@@ -5195,7 +5379,10 @@ struct BatteryHistoryChartView: View {
         }
 
         ensureHistoryIndex()
-        for dev in vm.devices { absorb(dev) }
+        for dev in vm.devices {
+            if isPlaceholderPhone(deviceId: dev.deviceId, serial: dev.serialNumber) { continue }
+            absorb(dev)
+        }
 
         for (key, pts) in ui.historyBuckets where key != "local_mac" && phones[key] == nil {
             guard let lastPt = pts.max(by: { $0.date < $1.date }) else { continue }
@@ -5212,7 +5399,7 @@ struct BatteryHistoryChartView: View {
                 capacityInt: Int(cap),
                 capacityExact: cap,
                 isCharging: false,
-                isFullyCharged: cap >= 100.0,
+                isFullyCharged: chargePercentIsMeasured(lastPt) && cap >= 99.5,
                 isACConnected: false,
                 cycleCount: lastPt.cycleCount,
                 batteryHealthPct: lastPt.healthPct,
@@ -5242,7 +5429,9 @@ struct BatteryHistoryChartView: View {
         let liveKeys = Set(vm.devices.filter { $0.deviceType != .mac && $0.deviceId != "local_mac" }.map {
             phoneGroupKey(deviceId: $0.deviceId, serial: $0.serialNumber, name: $0.deviceName, model: $0.hardwareModel)
         })
-        let current = phones.first(where: { $0.value.isConnected && liveKeys.contains($0.key) })?.value
+        // The 18 Pro stays the main phone. A 17 Pro top-up does not move it into Retired.
+        let current = phones["iphone-18-pro"]
+            ?? phones.first(where: { liveKeys.contains($0.key) && !isArchivedPhone(deviceId: $0.value.deviceId, serial: $0.value.serialNumber, name: $0.value.deviceName, model: $0.value.hardwareModel) })?.value
             ?? phones.first(where: { liveKeys.contains($0.key) })?.value
 
         var list: [DeviceBatteryData] = []
@@ -5250,7 +5439,12 @@ struct BatteryHistoryChartView: View {
         if let current { list.append(current) }
         let retired = phones.values
             .filter { $0.deviceId != current?.deviceId }
-            .sorted { $0.deviceName < $1.deviceName }
+            .sorted { (devA, devB) -> Bool in
+                let dateA = devA.lastSeenAt ?? .distantPast
+                let dateB = devB.lastSeenAt ?? .distantPast
+                if dateA != dateB { return dateA > dateB }
+                return devA.deviceName > devB.deviceName
+            }
         list.append(contentsOf: retired)
         return list
     }
@@ -5281,6 +5475,7 @@ struct BatteryHistoryChartView: View {
         var buckets: [String: [BatteryHistoryPoint]] = [:]
         var days: [String: [String: [BatteryHistoryPoint]]] = [:]
         for pt in vm.historyPoints {
+            if isPlaceholderPhone(deviceId: pt.deviceId, serial: pt.deviceSerial, batterySerial: pt.batterySerial) { continue }
             let key = phoneGroupKey(deviceId: pt.deviceId, serial: pt.deviceSerial, name: pt.deviceName, model: pt.deviceModel)
             buckets[key, default: []].append(pt)
             days[key, default: [:]][snapshotDayKey(pt.date), default: []].append(pt)
@@ -5449,15 +5644,33 @@ struct BatteryHistoryChartView: View {
         return ui.snapshotsByDay[snapshotDayKey(date)] ?? []
     }
 
-    private var graphRangeStart: Date? {
-        guard let months = selectedGraphRange.months else { return nil }
-        return Calendar.current.date(byAdding: .month, value: -months, to: Date())
+    private var activePhoneIsNew18: Bool {
+        guard let dev = activeDevice, dev.deviceType != .mac else { return false }
+        return phoneGroupKey(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel) == "iphone-18-pro"
+    }
+
+    /// The 18 Pro log is only a few days old, so its chart stays on that window.
+    private var effectiveGraphRange: GraphRange {
+        activePhoneIsNew18 ? .fewDays : selectedGraphRange
     }
 
     private var graphPoints: [BatteryHistoryPoint] {
         let sorted = matchedPoints.sorted(by: { $0.date < $1.date })
-        guard let start = graphRangeStart else { return sorted }
-        return sorted.filter { $0.date >= start }
+        if let days = effectiveGraphRange.days {
+            return points(inLastDays: days, of: sorted)
+        }
+        guard let months = effectiveGraphRange.months else { return sorted }
+        return points(inLastMonths: months, of: sorted)
+    }
+
+    /// Calendar window ending at this phone's latest reading, so a retired log is not measured from today.
+    private func graphAxisWindow(ending end: Date?, months: Int?, days: Int? = nil) -> (start: Date, end: Date)? {
+        guard let end else { return nil }
+        if let days, let start = Calendar.current.date(byAdding: .day, value: -days, to: end) {
+            return (start, end)
+        }
+        guard let months, let start = Calendar.current.date(byAdding: .month, value: -months, to: end) else { return nil }
+        return (start, end)
     }
 
     /// Month buttons describe the current iPhone. The retired phone is drawn at those same cycle numbers.
@@ -5465,7 +5678,17 @@ struct BatteryHistoryChartView: View {
         let phone = historyDevices.first { $0.deviceType != .mac && $0.deviceId == currentPhoneId }
         let currentAll = (phone.map { pointsFor($0) } ?? []).sorted { $0.date < $1.date }
         let retiredAll = pointsFor(other)
-        guard let months = selectedGraphRange.months else { return (currentAll, retiredAll) }
+        if let days = effectiveGraphRange.days {
+            let current = points(inLastDays: days, of: currentAll)
+            let cycles = current.compactMap(\.cycleCount)
+            guard let lo = cycles.min(), let hi = cycles.max() else { return (current, []) }
+            let retired = retiredAll.filter { pt in
+                guard let cycle = pt.cycleCount else { return false }
+                return cycle >= lo && cycle <= hi
+            }
+            return (current, retired)
+        }
+        guard let months = effectiveGraphRange.months else { return (currentAll, retiredAll) }
         let current = points(inLastMonths: months, of: currentAll)
         let cycles = current.compactMap(\.cycleCount)
         guard let lo = cycles.min(), let hi = cycles.max() else { return (current, []) }
@@ -5481,18 +5704,24 @@ struct BatteryHistoryChartView: View {
         guard let latest = samples.map(\.date).max() else { return [] }
         let end = min(latest, Date())
         guard let start = Calendar.current.date(byAdding: .month, value: -months, to: end) else { return samples }
-        let window = samples.filter { $0.date >= start && $0.date <= end.addingTimeInterval(60) }
-        return window.isEmpty ? samples : window
+        return samples.filter { $0.date >= start && $0.date <= end.addingTimeInterval(60) }
+    }
+
+    private func points(inLastDays days: Int, of samples: [BatteryHistoryPoint]) -> [BatteryHistoryPoint] {
+        guard let latest = samples.map(\.date).max() else { return [] }
+        let end = min(latest, Date())
+        guard let start = Calendar.current.date(byAdding: .day, value: -days, to: end) else { return samples }
+        return samples.filter { $0.date >= start && $0.date <= end.addingTimeInterval(60) }
     }
 
     private func graphSubtitle(for dev: DeviceBatteryData) -> String {
-        let range = selectedGraphRange == .all ? "Complete trajectory" : selectedGraphRange.rawValue
+        let range = effectiveGraphRange == .all ? "Complete trajectory" : effectiveGraphRange.rawValue
         guard let other = comparablePhones.first(where: { $0.deviceId == compareDeviceId }) else {
             return "\(range) for \(dev.deviceName) from \(graphPoints.count) data points"
         }
         let cycles = overlaySeries(for: other).current.compactMap(\.cycleCount)
-        if let lo = cycles.min(), let hi = cycles.max(), selectedGraphRange != .all {
-            return "\(selectedGraphRange.rawValue) · cycles \(lo)–\(hi) · \(dev.deviceName) vs \(other.deviceName)"
+        if let lo = cycles.min(), let hi = cycles.max(), effectiveGraphRange != .all {
+            return "\(effectiveGraphRange.rawValue) · cycles \(lo)–\(hi) · \(dev.deviceName) vs \(other.deviceName)"
         }
         return "\(range) · \(dev.deviceName) vs \(other.deviceName)"
     }
@@ -5677,7 +5906,7 @@ struct BatteryHistoryChartView: View {
                 HStack(spacing: 8) {
                     ForEach(historyDevices) { dev in
                         let count = pointsFor(dev).count
-                        let isRetired = dev.deviceType != .mac && dev.deviceId != currentPhoneId
+                        let isRetired = isArchivedPhone(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel)
 
                         Button(action: { selectedDevId = dev.id }) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -5945,7 +6174,6 @@ struct BatteryHistoryChartView: View {
     private var modernDataTableContent: some View {
         ScrollView(.vertical, showsIndicators: true) {
             LazyVStack(spacing: 0) {
-                let _ = activeDevice?.deviceId
                 ForEach(Array(displayedPoints.enumerated()), id: \.element.id) { index, pt in
                     let dayKey = snapshotDayKey(pt.date)
                     let isOpen = aggregateDaily && selectedSnapshotDayKey == dayKey
@@ -5970,9 +6198,15 @@ struct BatteryHistoryChartView: View {
         }
     }
 
+    /// End of the selected phone's own log. Today and yesterday stay on the wall clock.
+    private var sampleHorizon: Date {
+        min(matchedPoints.map(\.date).max() ?? Date(), Date())
+    }
+
     private var currentTempTimeRange: (start: Date, end: Date, isSingleDay: Bool, title: String) {
         let cal = Calendar.current
         let now = Date()
+        let horizon = sampleHorizon
 
         if let customKey = selectedCustomDateKey {
             let df = DateFormatter()
@@ -5997,27 +6231,28 @@ struct BatteryHistoryChartView: View {
             let e = s.addingTimeInterval(86400)
             return (s, e, true, "Yesterday (Full 24h Timeline)")
         case .last7:
-            let s = cal.date(byAdding: .day, value: -7, to: now) ?? now.addingTimeInterval(-7*86400)
-            return (s, now, false, "Last 7 Days")
+            let s = cal.date(byAdding: .day, value: -7, to: horizon) ?? horizon.addingTimeInterval(-7*86400)
+            return (s, horizon, false, "Last 7 Days")
         case .last30:
-            let s = cal.date(byAdding: .day, value: -30, to: now) ?? now.addingTimeInterval(-30*86400)
-            return (s, now, false, "Last 30 Days")
+            let s = cal.date(byAdding: .day, value: -30, to: horizon) ?? horizon.addingTimeInterval(-30*86400)
+            return (s, horizon, false, "Last 30 Days")
         case .oneMonth:
-            let s = cal.date(byAdding: .month, value: -1, to: now) ?? now.addingTimeInterval(-30*86400)
-            return (s, now, false, "Last 1 Month")
+            let s = cal.date(byAdding: .month, value: -1, to: horizon) ?? horizon.addingTimeInterval(-30*86400)
+            return (s, horizon, false, "Last 1 Month")
         case .threeMonths:
-            let s = cal.date(byAdding: .month, value: -3, to: now) ?? now.addingTimeInterval(-90*86400)
-            return (s, now, false, "Last 3 Months")
+            let s = cal.date(byAdding: .month, value: -3, to: horizon) ?? horizon.addingTimeInterval(-90*86400)
+            return (s, horizon, false, "Last 3 Months")
         case .sixMonths:
-            let s = cal.date(byAdding: .month, value: -6, to: now) ?? now.addingTimeInterval(-182*86400)
-            return (s, now, false, "Last 6 Months")
+            let s = cal.date(byAdding: .month, value: -6, to: horizon) ?? horizon.addingTimeInterval(-182*86400)
+            return (s, horizon, false, "Last 6 Months")
         case .twelveMonths:
-            let s = cal.date(byAdding: .month, value: -12, to: now) ?? now.addingTimeInterval(-365*86400)
-            return (s, now, false, "Last 12 Months")
+            let s = cal.date(byAdding: .month, value: -12, to: horizon) ?? horizon.addingTimeInterval(-365*86400)
+            return (s, horizon, false, "Last 12 Months")
         case .all:
             let allT = matchedPoints.filter { $0.temperatureC != nil }
-            let s = allT.first?.date ?? now.addingTimeInterval(-86400)
-            return (s, now, false, "All Logged History")
+            let s = allT.map(\.date).min() ?? horizon.addingTimeInterval(-86400)
+            let e = min(allT.map(\.date).max() ?? horizon, Date())
+            return (s, e, false, "All Logged History")
         }
     }
 
@@ -6372,6 +6607,13 @@ struct BatteryHistoryChartView: View {
                 let overlay = compareDev.map { overlaySeries(for: $0) }
                 let comparisonList = overlay?.retired ?? []
                 let plottedPoints = overlay?.current ?? graphPoints
+                let axis = compareDev == nil
+                    ? graphAxisWindow(
+                        ending: plottedPoints.map(\.date).max().map { min($0, Date()) },
+                        months: effectiveGraphRange.months,
+                        days: effectiveGraphRange.days
+                    )
+                    : nil
                 BatteryDegradationGraphCanvas(
                     points: plottedPoints,
                     showHealth: showHealthGraph,
@@ -6381,8 +6623,8 @@ struct BatteryHistoryChartView: View {
                     comparisonPoints: comparisonList,
                     comparisonLabel: compareDev?.deviceName ?? "Retired",
                     alignByCycles: compareDev != nil,
-                    fixedMinTime: compareDev == nil ? graphRangeStart?.timeIntervalSince1970 : nil,
-                    fixedMaxTime: (compareDev != nil || graphRangeStart == nil) ? nil : Date().timeIntervalSince1970
+                    fixedMinTime: axis?.start.timeIntervalSince1970,
+                    fixedMaxTime: axis?.end.timeIntervalSince1970
                 )
                 .frame(height: 170)
                 .background(Color.black.opacity(0.3).cornerRadius(10))
@@ -6420,8 +6662,8 @@ struct BatteryHistoryChartView: View {
 
     private var graphRangePills: some View {
         HStack(spacing: 4) {
-            ForEach(GraphRange.allCases, id: \.self) { range in
-                let isSelected = selectedGraphRange == range
+            ForEach(activePhoneIsNew18 ? [GraphRange.fewDays] : GraphRange.allCases.filter { $0 != .fewDays }, id: \.self) { range in
+                let isSelected = effectiveGraphRange == range
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) {
                         selectedGraphRange = range
@@ -6645,7 +6887,7 @@ struct BatteryHistoryChartView: View {
         if !parsedPoints.isEmpty {
             var existingKeys = Set(vm.historyPoints.map { "\($0.deviceId)_\(Int($0.date.timeIntervalSince1970))" })
             var added = 0
-            for pt in parsedPoints {
+            for pt in parsedPoints where !isPlaceholderPhone(deviceId: pt.deviceId, serial: pt.deviceSerial, batterySerial: pt.batterySerial) {
                 let k = "\(pt.deviceId)_\(Int(pt.date.timeIntervalSince1970))"
                 if existingKeys.insert(k).inserted {
                     vm.historyPoints.append(pt)
@@ -6653,7 +6895,7 @@ struct BatteryHistoryChartView: View {
                 }
             }
             vm.historyPoints.sort(by: { $0.date < $1.date })
-            vm.savePersisted()
+            if added > 0 { vm.commitHistoryEdits() }
             importError = nil
             withAnimation { exportSuccess = true }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { exportSuccess = false }
@@ -6694,8 +6936,8 @@ struct BatteryHistoryChartView: View {
                 batteryManufactureDate: nil,
                 deviceManufactureDate: nil,
                 firstUseDate: nil,
-                isCharging: false,
-                isACConnected: true,
+                isCharging: nil,
+                isACConnected: nil,
                 chargingWatts: nil,
                 deviceModel: devModel,
                 osVersion: osVer,
@@ -6707,7 +6949,7 @@ struct BatteryHistoryChartView: View {
         guard !imported.isEmpty else { importError = "No valid rows found."; return }
         var existingKeys = Set(vm.historyPoints.map { "\($0.deviceId)_\(Int($0.date.timeIntervalSince1970))" })
         var added = 0
-        for pt in imported {
+        for pt in imported where !isPlaceholderPhone(deviceId: pt.deviceId, serial: pt.deviceSerial, batterySerial: pt.batterySerial) {
             let k = "\(pt.deviceId)_\(Int(pt.date.timeIntervalSince1970))"
             if existingKeys.insert(k).inserted {
                 vm.historyPoints.append(pt)
@@ -6715,7 +6957,7 @@ struct BatteryHistoryChartView: View {
             }
         }
         vm.historyPoints.sort(by: { $0.date < $1.date })
-        vm.savePersisted()
+        if added > 0 { vm.commitHistoryEdits() }
         importError = nil
         withAnimation { exportSuccess = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { exportSuccess = false }
@@ -8651,14 +8893,23 @@ struct BatteryWidgetView: View {
 final class AutoFitHostingView<Content: View>: NSHostingView<Content> {
     var onFittingSize: ((NSSize) -> Void)?
     private var lastFitting: NSSize = .zero
+    private var sizeBumpQueued = false
     override var mouseDownCanMoveWindow: Bool { true }
 
     override func layout() {
         super.layout()
         let s = fittingSize
         guard s.width > 0 && s.height > 0 else { return }
+        if abs(s.width - lastFitting.width) < 0.5 && abs(s.height - lastFitting.height) < 0.5 { return }
         lastFitting = s
-        onFittingSize?(s)
+        guard !sizeBumpQueued else { return }
+        sizeBumpQueued = true
+        // Resize on the next turn, without copying the fitting closure into the block.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sizeBumpQueued = false
+            self.onFittingSize?(self.lastFitting)
+        }
     }
 }
 
@@ -8677,12 +8928,32 @@ final class FloatingPanel: NSPanel {
     }
 }
 
+/// Above other windows while it is key. A click on another window drops it back underneath.
+final class SettingsWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override var isMovableByWindowBackground: Bool {
+        get { true }
+        set { }
+    }
+
+    override func becomeKey() {
+        super.becomeKey()
+        level = .floating
+    }
+
+    override func resignKey() {
+        super.resignKey()
+        level = .normal
+    }
+}
+
 // MARK: - AppDelegate
 
 @MainActor
 @objc final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: FloatingPanel?
-    private var historyPanel: FloatingPanel?
+    private var historyPanel: SettingsWindow?
     private var hosting: AutoFitHostingView<BatteryWidgetView>!
     private var vm: BatteryWidgetViewModel!
 
@@ -8702,19 +8973,24 @@ final class FloatingPanel: NSPanel {
     }
 
     func toggleHistoryWindow() {
-        if let hp = historyPanel, hp.isVisible {
-            hp.orderOut(nil)
-            historyPanel = nil
+        if let hp = historyPanel {
+            if hp.isVisible && hp.isKeyWindow {
+                hp.orderOut(nil)
+            } else {
+                raiseHistoryWindow(hp)
+            }
             return
         }
         openHistoryWindow()
     }
 
+    private func raiseHistoryWindow(_ hp: NSWindow) {
+        NSApp.activate(ignoringOtherApps: true)
+        hp.level = .floating
+        hp.makeKeyAndOrderFront(nil)
+    }
+
     func openHistoryWindow() {
-        if let existing = historyPanel {
-            existing.orderOut(nil)
-            historyPanel = nil
-        }
         
         guard let p = self.panel else { return }
         let screen = p.screen ?? NSScreen.main ?? NSScreen.screens.first
@@ -8728,23 +9004,22 @@ final class FloatingPanel: NSPanel {
             vm: vm,
             onClose: { [weak self] in
                 self?.historyPanel?.orderOut(nil)
-                self?.historyPanel = nil
             }
         )
         
         let host = NSHostingView(rootView: historyView)
         host.frame = NSRect(origin: .zero, size: historySize)
         
-        let win = FloatingPanel(
+        let win = SettingsWindow(
             contentRect: host.frame,
-            styleMask: [.nonactivatingPanel, .borderless],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         win.isOpaque = false
         win.backgroundColor = .clear
         win.hasShadow = true
-        win.level = .floating
+        win.level = .normal
         win.collectionBehavior = [.managed, .fullScreenNone]
         win.isMovableByWindowBackground = true
         win.hidesOnDeactivate = false
@@ -8772,7 +9047,7 @@ final class FloatingPanel: NSPanel {
         
         win.setFrameOrigin(NSPoint(x: historyX, y: historyY))
         historyPanel = win
-        win.orderFrontRegardless()
+        raiseHistoryWindow(win)
     }
 
     private var cancellables = Set<AnyCancellable>()
