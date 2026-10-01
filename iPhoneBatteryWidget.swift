@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.18"
+    static let appVersion = "1.0.19"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -161,6 +161,7 @@ private let kFrameOriginX = "ibw.frameOriginX"
 private let kFrameTopY    = "ibw.frameTopY"
 private let kCachedDevicesKey = "ibw.cachedDevicesData.v2"
 private let kHistoryLogKey = "ibw.batteryHistoryLog.v2"
+private let persistQueue = DispatchQueue(label: "ibw.persist", qos: .utility)
 private let kLidHistoryLogKey = "ibw.lidHistoryLog.v1"
 private let kSelectedTabKey = "ibw.selectedDeviceTab"
 private let kPollInterval: TimeInterval = 1.0
@@ -169,15 +170,26 @@ private let kIOSPollInterval: TimeInterval = 3.0
 
 // MARK: - Privacy & Standardized Device Name Resolver
 
+/// Product family only ("MacBook Pro", "Mac mini"), never the host name. Falls back to "MacBook Air".
+func macFamilyName(_ hints: String?...) -> String {
+    let blob = hints.compactMap { $0?.lowercased().replacingOccurrences(of: " ", with: "") }.joined(separator: " ")
+    if blob.contains("macbookpro") { return "MacBook Pro" }
+    if blob.contains("macmini") { return "Mac mini" }
+    if blob.contains("macstudio") { return "Mac Studio" }
+    if blob.contains("imac") { return "iMac" }
+    if blob.contains("macpro") { return "Mac Pro" }
+    return "MacBook Air"
+}
+
 func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: String? = nil, deviceType: DeviceType? = nil) -> String {
     if deviceId == "local_mac" || deviceType == .mac || (model?.lowercased().contains("mac") ?? false) {
-        return "MacBook Air"
+        return macFamilyName(model, name)
     }
     
     if let n = name, !n.isEmpty {
         let lower = n.lowercased()
         if lower.contains("mac") {
-            return "MacBook Air"
+            return macFamilyName(model, n)
         }
         let cleaned = cleanDeviceDisplayName(n, fallback: "")
         if !cleaned.isEmpty && cleaned != "iPhone" && cleaned != "iPad" {
@@ -210,6 +222,18 @@ func canonicalDeviceDisplayName(name: String?, model: String? = nil, deviceId: S
     return "iPhone"
 }
 
+/// UDID and serial fragments for this user's own phones, mapped to an archive group
+/// ("iphone-15", "iphone-17-pro", "iphone-18-pro"). They live only in the local defaults
+/// key `ibw.deviceAliases`, never in source: the repo is public.
+private let localDeviceAliases: [(token: String, group: String)] = {
+    let raw = UserDefaults.standard.dictionary(forKey: "ibw.deviceAliases") as? [String: String] ?? [:]
+    return raw.map { ($0.key.lowercased(), $0.value) }.filter { !$0.0.isEmpty }
+}()
+
+func localDeviceAliasGroup(_ lowercasedBlob: String) -> String? {
+    localDeviceAliases.first { lowercasedBlob.contains($0.token) }?.group
+}
+
 /// Same physical phone, including the UDID and serial aliases already in the archive.
 func phoneGroupKey(deviceId: String, serial: String? = nil, name: String? = nil, model: String? = nil) -> String {
     let id = deviceId.lowercased()
@@ -218,15 +242,12 @@ func phoneGroupKey(deviceId: String, serial: String? = nil, name: String? = nil,
     let modelL = (model ?? "").lowercased()
     let blob = "\(id) \(serialL) \(nameL) \(modelL)"
     if id == "local_mac" || blob.contains("macbook") || modelL.contains("mac") { return "local_mac" }
-    if blob.contains("redacted-id-c") || blob.contains("redacted-sn-c") || modelL.contains("iphone15,4") || nameL.contains("iphone 15") {
+    // Unique ids before names, so a label cannot pull another phone into the wrong archive.
+    if let group = localDeviceAliasGroup(blob) { return group }
+    if modelL.contains("iphone15,4") || nameL.contains("iphone 15") {
         return "iphone-15"
     }
-    // Unique ids before names, so a label cannot pull another phone into the wrong archive.
-    if blob.contains("redacted-udid-a") || blob.contains("redacted-sn-a") {
-        return "iphone-17-pro"
-    }
-    if blob.contains("redacted-udid-b") || blob.contains("redacted-sn-b")
-        || modelL.contains("iphone19,") || nameL.contains("18 pro") || modelL.contains("18 pro") {
+    if modelL.contains("iphone19,") || nameL.contains("18 pro") || modelL.contains("18 pro") {
         return "iphone-18-pro"
     }
     if modelL == "iphone18,1" || nameL.contains("17 pro") || modelL.contains("17 pro") {
@@ -235,7 +256,7 @@ func phoneGroupKey(deviceId: String, serial: String? = nil, name: String? = nil,
     return id.isEmpty ? blob : id
 }
 
-/// Kept so older call sites still compile. UDID redacted-udid-b and serial redacted-sn-b are the real iPhone 18 Pro (iPhone19,2).
+/// Kept so older call sites still compile. The real iPhone 18 Pro is mapped in the local `ibw.deviceAliases`.
 func isPlaceholderPhone(deviceId: String, serial: String? = nil, batterySerial: String? = nil) -> Bool {
     false
 }
@@ -285,13 +306,19 @@ func canonicalDeviceModelName(model: String?, name: String? = nil, deviceId: Str
         return "MacBookAir10,1"
     }
     let blob = "\(deviceId ?? "") \(name ?? "")".lowercased()
-    if blob.contains("redacted-id-c") || blob.contains("iphone 15") || blob.contains("redacted-sn-c") {
+    switch localDeviceAliasGroup(blob) {
+    case "iphone-15": return "iPhone15,4"
+    case "iphone-17-pro": return "iPhone18,1"
+    case "iphone-18-pro": return "iPhone19,2"
+    default: break
+    }
+    if blob.contains("iphone 15") {
         return "iPhone15,4"
     }
     if blob.contains("18 pro") || blob.contains("iphone19") {
         return "iPhone19,2"
     }
-    if blob.contains("00008150") || blob.contains("17 pro") || blob.contains("redacted-sn-a") {
+    if blob.contains("00008150") || blob.contains("17 pro") {
         return "iPhone18,1"
     }
     return "iPhone"
@@ -775,8 +802,9 @@ enum MacBatteryReader {
         return nil
     }
 
-    static func fetch() -> DeviceBatteryData {
-        let batt = serviceProperties("AppleSmartBattery") ?? [:]
+    /// nil when IOKit gives no real reading. Callers keep the last one; nothing is invented.
+    static func fetch() -> DeviceBatteryData? {
+        guard let batt = serviceProperties("AppleSmartBattery"), !batt.isEmpty else { return nil }
         let battData = asDict(batt["BatteryData"]) ?? [:]
         let packData = asDict(serviceProperties("AppleSmartBatteryPack")?["BatteryData"]) ?? [:]
         let adapter = asDict(batt["AdapterDetails"]) ?? [:]
@@ -791,10 +819,9 @@ enum MacBatteryReader {
         let curCap = firstInt(["CurrentCapacity"], in: [batt, battData])
         let remMah = firstInt(["AppleRawCurrentCapacity", "RemainingCapacity"], in: [batt, packData, battData])
 
-        let fcc = fullCharge ?? 4241
-        let dCap = designCap ?? 4382
-        let rem = remMah ?? 2653
-        let cInt = curCap ?? 66
+        guard let fcc = fullCharge, let cInt = curCap else { return nil }
+        let dCap = designCap ?? fcc
+        let rem = remMah ?? Int((Double(fcc) * Double(cInt) / 100.0).rounded())
         let exactPct = Double(cInt)
         let healthPct = dCap > 0 ? ((Double(fcc) / Double(dCap)) * 100.0) : 100.0
 
@@ -1223,33 +1250,50 @@ enum CappedProcess {
         proc.arguments = args
         let pipe = Pipe()
         proc.standardOutput = pipe
-        proc.standardError = Pipe()
+        proc.standardError = FileHandle.nullDevice
         do { try proc.run() } catch { return nil }
         let pid = proc.processIdentifier
         _ = setpgid(pid, pid)
+        // Drain stdout while the child runs. A full 64 KB pipe would block it until the timeout.
+        let output = OutputBox()
+        let drained = DispatchSemaphore(value: 0)
+        let reader = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async {
+            output.data = reader.readDataToEndOfFile()
+            drained.signal()
+        }
         let start = Date()
         while proc.isRunning && Date().timeIntervalSince(start) < timeout {
             usleep(20_000)
         }
         if proc.isRunning {
             forceStop(proc)
+            _ = drained.wait(timeout: .now() + 0.5)
             return nil
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return (proc.terminationStatus, data)
+        guard drained.wait(timeout: .now() + 0.5) == .success else { return nil }
+        return (proc.terminationStatus, output.data)
+    }
+
+    private final class OutputBox: @unchecked Sendable {
+        var data = Data()
     }
 
     /// Reap leftover usbmuxd Python probes from older builds / crashed parents.
-    static func killStaleUsbmuxPython() {
-        guard let (_, data) = run("/bin/ps", args: ["-ax", "-o", "pid=,command="], timeout: 1.5),
+    /// `includeOwnChildren` is for quit. At launch our own fresh probes must survive.
+    static func killStaleUsbmuxPython(includeOwnChildren: Bool = false) {
+        guard let (_, data) = run("/bin/ps", args: ["-ax", "-o", "pid=,ppid=,command="], timeout: 1.5),
               let text = String(data: data, encoding: .utf8) else { return }
         let selfPid = ProcessInfo.processInfo.processIdentifier
         for line in text.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.contains("usbmuxd") || trimmed.contains("ProgName': 'BW'") || trimmed.contains("bw_1.0") else { continue }
+            // Only our own probes carry these tags. A bare "usbmuxd" match would hit other tools.
+            guard trimmed.contains("ProgName': 'BW'") || trimmed.contains("bw_1.0") else { continue }
             guard trimmed.localizedCaseInsensitiveContains("python") else { continue }
-            let pidStr = trimmed.prefix(while: { $0.isNumber })
-            guard let pid = Int32(pidStr), pid > 1, pid != selfPid else { continue }
+            let cols = trimmed.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard cols.count >= 2, let pid = Int32(cols[0]), let ppid = Int32(cols[1]),
+                  pid > 1, pid != selfPid else { continue }
+            if ppid == selfPid && !includeOwnChildren { continue }
             kill(pid, SIGTERM)
             usleep(30_000)
             kill(pid, SIGKILL)
@@ -2140,39 +2184,16 @@ final class MacLidTracker {
         let sevenDaysAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
         let startStr = df.string(from: sevenDaysAgo)
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/bin/sh")
-        let cmd = "/usr/bin/pmset -g log --start '\(startStr)' | /usr/bin/grep -E 'com\\.apple\\.powermanagement\\.lidopen|Clamshell Sleep'"
-        proc.arguments = ["-c", cmd]
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-
-        var outputData = Data()
-        let group = DispatchGroup()
-        group.enter()
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            outputData = pipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-
-        do {
-            try proc.run()
-        } catch {
+        // Run pmset directly, not through `sh`, so a timeout kills pmset itself.
+        // It takes about 3 s of CPU for 7 days of log, so callers must not run this often.
+        guard let (_, outputData) = CappedProcess.run("/usr/bin/pmset", args: ["-g", "log", "--start", startStr], timeout: 10.0),
+              let fullLog = String(data: outputData, encoding: .utf8) else {
             return []
         }
-
-        let result = group.wait(timeout: .now() + 6.0)
-        if result == .timedOut {
-            proc.terminate()
-            return []
-        }
-        proc.waitUntilExit()
-
-        guard let output = String(data: outputData, encoding: .utf8) else {
-            return []
-        }
+        let output = fullLog
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .filter { $0.contains("com.apple.powermanagement.lidopen") || $0.contains("Clamshell Sleep") }
+            .joined(separator: "\n")
 
         var rawOpens: [Date] = []
         var rawCloses: [Date] = []
@@ -2336,6 +2357,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var isBusy = false
     private var isIOSBusy = false
     private var lastMacData: DeviceBatteryData?
+    private var lastMacReadAt: Date = .distantPast
     private var lastIOSFetchAt: Date = .distantPast
     private var lastIOSDevices: [DeviceBatteryData] = []
     private var lastUDIDs: [(String, Bool)] = []
@@ -2403,12 +2425,22 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
+    private var lidRefreshInFlight = false
+    private var lidRefreshPending = false
+
     func refreshLidSessions() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        // pmset is expensive. Triggers that arrive mid-run collapse into one follow-up run.
+        guard !lidRefreshInFlight else {
+            lidRefreshPending = true
+            return
+        }
+        lidRefreshInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let freshSessions = MacLidTracker.shared.fetchAllLidSessions()
             
             DispatchQueue.main.async {
+                self.lidRefreshInFlight = false
                 // Merge freshSessions into persisted allLidSessions without duplicating
                 var map: [String: LidSession] = [:]
                 for s in self.allLidSessions {
@@ -2422,13 +2454,17 @@ final class BatteryWidgetViewModel: ObservableObject {
                 self.todayLidSessions = merged.filter { MacLidTracker.isDateInCurrentLidDayCycle($0.openDate) }
                 self.firstLidOpenToday = self.todayLidSessions.min(by: { $0.openDate < $1.openDate })?.openDate
                 self.saveLidSessions()
+                if self.lidRefreshPending {
+                    self.lidRefreshPending = false
+                    self.refreshLidSessions()
+                }
             }
         }
     }
 
     private func saveLidSessions() {
         let sessions = allLidSessions
-        Task.detached(priority: .background) {
+        persistQueue.async {
             if let data = try? JSONEncoder().encode(sessions) {
                 UserDefaults.standard.set(data, forKey: kLidHistoryLogKey)
             }
@@ -2595,9 +2631,13 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
-    func savePersisted() {
+    /// Pass `waitUntilDone` at quit. Otherwise the history write can be cut off.
+    func savePersisted(waitUntilDone: Bool = false) {
         saveDevices()
         saveHistory()
+        if waitUntilDone {
+            persistQueue.sync {}
+        }
     }
 
     private func saveDevices() {
@@ -2614,7 +2654,8 @@ final class BatteryWidgetViewModel: ObservableObject {
         guard historyDirty else { return }
         historyDirty = false
         let pts = historyPoints
-        Task.detached(priority: .background) {
+        // One serial queue keeps writes in order, so an older snapshot never lands last.
+        persistQueue.async {
             if let data = try? JSONEncoder().encode(pts) {
                 UserDefaults.standard.set(data, forKey: kHistoryLogKey)
             }
@@ -2651,8 +2692,11 @@ final class BatteryWidgetViewModel: ObservableObject {
             let macData = MacBatteryReader.fetch()
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.lastMacData = macData
-                self.considerPDHandshakeHint(macData)
+                if let macData {
+                    self.lastMacData = macData
+                    self.lastMacReadAt = Date()
+                    self.considerPDHandshakeHint(macData)
+                }
                 self.rebuildDevicesList()
                 if manual && !self.isIOSBusy {
                     self.isRefreshing = false
@@ -2796,7 +2840,10 @@ final class BatteryWidgetViewModel: ObservableObject {
 
         var finalDevices: [DeviceBatteryData] = []
         finalDevices.append(enrichedMac)
-        self.recordHistory(enrichedMac)
+        // Only a fresh IOKit reading goes into history, never a stale or cached one.
+        if Date().timeIntervalSince(lastMacReadAt) < 10 {
+            self.recordHistory(enrichedMac)
+        }
 
         // Record history snapshots for any detected iOS device (preserving archived iPhone 17 Pro telemetry if seen)
         for iosDev in self.lastIOSDevices where iosDev.deviceType != .mac {
@@ -3173,6 +3220,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var lastKnownAllUDIDs: Set<String>? = nil
     private var missingUDIDCounts: [String: Int] = [:]
     private var usbHardwareDetector: USBPortDetector?
+    private var watcherProbeInFlight = false
 
     private func startFastConnectionWatcher() {
         // 1. Hardware-level instant IOKit USB matching (< 5ms notification on physical plug/unplug)
@@ -3195,13 +3243,19 @@ final class BatteryWidgetViewModel: ObservableObject {
         // 2. Regular polling backup for network/Wi-Fi devices and usbmux state (1.5s interval with debounce hysteresis)
         connectionWatcherTimer?.invalidate()
         let t = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
-            Task.detached(priority: .utility) {
-                let currentUDIDs = iDeviceReader.listConnectedUDIDs()
-                let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") }.map { $0.udid })
-                let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") }.map { $0.udid })
+            Task { @MainActor [weak self] in
+                // The fallback probes can take ~5 s. Skip ticks rather than stack processes.
+                guard let self, !self.watcherProbeInFlight else { return }
+                self.watcherProbeInFlight = true
+                Task.detached(priority: .utility) {
+                    let currentUDIDs = iDeviceReader.listConnectedUDIDs()
+                    let currentWired = Set(currentUDIDs.filter { !$0.isNetwork && !$0.udid.contains("local") }.map { $0.udid })
+                    let currentAll = Set(currentUDIDs.filter { !$0.udid.contains("local") }.map { $0.udid })
 
-                await MainActor.run { [weak self] in
-                    self?.checkConnectionTransitions(wired: currentWired, all: currentAll, isHardwareEvent: false)
+                    await MainActor.run { [weak self] in
+                        self?.watcherProbeInFlight = false
+                        self?.checkConnectionTransitions(wired: currentWired, all: currentAll, isHardwareEvent: false)
+                    }
                 }
             }
         }
@@ -3365,7 +3419,8 @@ final class BatteryWidgetViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.refresh(manual: false)
-                if Date().timeIntervalSince(self.lastLidSessionCheck) >= 60.0 {
+                // Lid events come with wakes, which refresh on their own. This is only a backstop.
+                if Date().timeIntervalSince(self.lastLidSessionCheck) >= 900.0 {
                     self.lastLidSessionCheck = Date()
                     self.refreshLidSessions()
                 }
@@ -3549,7 +3604,9 @@ final class AudioSystemEngine {
         AudioObjectSetPropertyData(deviceID, &muteAddress, 0, nil, muteSize, &mute)
     }
 
-    func playWithFixedVolume(level: Float = 0.5, duration: TimeInterval = 0.8, action: () -> Void) {
+    /// `action` plays the sound and returns its length. The volume is restored only after it ends;
+    /// a fixed 0.8 s cut most chimes (Glass, Pop, Blow run 1.4–1.65 s) in half.
+    func playWithFixedVolume(level: Float = 0.5, duration: TimeInterval = 0.8, action: () -> TimeInterval) {
         restoreWorkItem?.cancel()
         restoreWorkItem = nil
 
@@ -3568,7 +3625,8 @@ final class AudioSystemEngine {
         }
         setMasterVolume(level)
 
-        action()
+        let soundLength = action()
+        let holdFor = max(duration, soundLength + 0.15)
 
         let item = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
@@ -3583,7 +3641,7 @@ final class AudioSystemEngine {
             self.restoreWorkItem = nil
         }
         self.restoreWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + holdFor, execute: item)
     }
 }
 
@@ -3593,7 +3651,9 @@ final class WidgetSoundPlayer {
     static let shared = WidgetSoundPlayer()
     private var activePlayers: [AVAudioPlayer] = []
 
-    func playSound(named soundName: String, fallback: String = "Pop", volume: Float = 0.5) {
+    /// Returns the length of the sound that started, or 0 if none did.
+    @discardableResult
+    func playSound(named soundName: String, fallback: String = "Pop", volume: Float = 0.5) -> TimeInterval {
         let soundCandidates: [URL]
         let lower = soundName.lowercased()
         if lower == "chime" || lower == "powerchime" || lower.contains("official") {
@@ -3620,13 +3680,14 @@ final class WidgetSoundPlayer {
                 DispatchQueue.main.asyncAfter(deadline: .now() + max(1.0, player.duration + 0.2)) { [weak self] in
                     self?.activePlayers.removeAll(where: { !$0.isPlaying })
                 }
-                return
+                return player.duration
             }
         }
         
         let nsFallback = NSSound(named: NSSound.Name(soundName)) ?? NSSound(named: NSSound.Name(fallback))
         nsFallback?.volume = volume
         nsFallback?.play()
+        return nsFallback?.duration ?? 0
     }
 }
 
@@ -3685,14 +3746,16 @@ final class PanAudioPlayer: NSObject, AVAudioPlayerDelegate {
     private var startTime: TimeInterval = 0
     private var duration: TimeInterval = 0
 
-    func playLeftToRight(named soundName: String, volume: Float = 0.5) {
+    /// Returns the length of the sound that started, or 0 if none did.
+    @discardableResult
+    func playLeftToRight(named soundName: String, volume: Float = 0.5) -> TimeInterval {
         let url = URL(fileURLWithPath: "/System/Library/Sounds/\(soundName).aiff")
         guard FileManager.default.fileExists(atPath: url.path),
               let p = try? AVAudioPlayer(contentsOf: url) else {
             let fallback = NSSound(named: NSSound.Name(soundName))
             fallback?.volume = volume
             fallback?.play()
-            return
+            return fallback?.duration ?? 0
         }
         self.player = p
         p.delegate = self
@@ -3720,6 +3783,7 @@ final class PanAudioPlayer: NSObject, AVAudioPlayerDelegate {
         }
         RunLoop.main.add(t, forMode: .common)
         self.timer = t
+        return p.duration
     }
 }
 
@@ -8930,6 +8994,11 @@ final class FloatingPanel: NSPanel {
 
 /// Above other windows while it is key. A click on another window drops it back underneath.
 final class SettingsWindow: NSWindow {
+    override init(contentRect: NSRect, styleMask style: NSWindow.StyleMask, backing backingStoreType: NSWindow.BackingStoreType, defer flag: Bool) {
+        super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
+        isReleasedWhenClosed = false
+    }
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
     override var isMovableByWindowBackground: Bool {
@@ -8951,7 +9020,7 @@ final class SettingsWindow: NSWindow {
 // MARK: - AppDelegate
 
 @MainActor
-@objc final class AppDelegate: NSObject, NSApplicationDelegate {
+@objc final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var panel: FloatingPanel?
     private var historyPanel: SettingsWindow?
     private var hosting: AutoFitHostingView<BatteryWidgetView>!
@@ -8966,7 +9035,9 @@ final class SettingsWindow: NSWindow {
             NSApp.terminate(nil)
             return
         }
-        CappedProcess.killStaleUsbmuxPython()
+        DispatchQueue.global(qos: .utility).async {
+            CappedProcess.killStaleUsbmuxPython()
+        }
         NSApp.setActivationPolicy(.regular)
         vm = BatteryWidgetViewModel()
         buildPanel()
@@ -8984,7 +9055,32 @@ final class SettingsWindow: NSWindow {
         openHistoryWindow()
     }
 
+    func windowWillClose(_ notification: Notification) {
+        if let win = notification.object as? NSWindow, win === historyPanel {
+            historyPanel = nil
+        }
+    }
+
     private func raiseHistoryWindow(_ hp: NSWindow) {
+        if let p = self.panel {
+            let screen = p.screen ?? NSScreen.main ?? NSScreen.screens.first
+            let vis = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+            let historyW = hp.frame.width > 0 ? hp.frame.width : 900
+            let historyH = hp.frame.height > 0 ? hp.frame.height : min(640, max(460, vis.height - 24))
+            
+            var historyY = p.frame.origin.y
+            if historyY < vis.minY + 8 { historyY = vis.minY + 8 }
+            if historyY + historyH > vis.maxY - 8 { historyY = max(vis.minY + 8, vis.maxY - 8 - historyH) }
+            
+            var historyX = p.frame.minX - historyW - 10
+            if historyX < vis.minX + 8 {
+                historyX = p.frame.maxX + 10
+                if historyX + historyW > vis.maxX - 8 {
+                    historyX = max(vis.minX + 8, min(vis.maxX - historyW - 8, p.frame.minX - historyW - 10))
+                }
+            }
+            hp.setFrameOrigin(NSPoint(x: historyX, y: historyY))
+        }
         NSApp.activate(ignoringOtherApps: true)
         hp.level = .floating
         hp.makeKeyAndOrderFront(nil)
@@ -9004,6 +9100,7 @@ final class SettingsWindow: NSWindow {
             vm: vm,
             onClose: { [weak self] in
                 self?.historyPanel?.orderOut(nil)
+                self?.historyPanel = nil
             }
         )
         
@@ -9016,6 +9113,8 @@ final class SettingsWindow: NSWindow {
             backing: .buffered,
             defer: false
         )
+        win.isReleasedWhenClosed = false
+        win.delegate = self
         win.isOpaque = false
         win.backgroundColor = .clear
         win.hasShadow = true
@@ -9101,6 +9200,7 @@ final class SettingsWindow: NSWindow {
             backing: .buffered,
             defer: false
         )
+        p.isReleasedWhenClosed = false
         p.level = .floating
         p.isOpaque = false
         p.backgroundColor = .clear
@@ -9206,8 +9306,8 @@ final class SettingsWindow: NSWindow {
 
     func applicationWillTerminate(_ note: Notification) {
         persistFrame()
-        vm?.savePersisted()
-        CappedProcess.killStaleUsbmuxPython()
+        vm?.savePersisted(waitUntilDone: true)
+        CappedProcess.killStaleUsbmuxPython(includeOwnChildren: true)
     }
 }
 
