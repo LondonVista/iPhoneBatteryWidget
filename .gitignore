@@ -7,3 +7,7 @@
 DerivedData/
 *.swp
 *.orig
+
+# Local agent notes (contain machine paths)
+CLAUDE.md
+GEMINI.md
