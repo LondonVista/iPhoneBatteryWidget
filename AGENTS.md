@@ -4,7 +4,7 @@ This rule applies to every AI coding tool (Claude, Grok, Antigravity/Gemini, Cod
 
 **Never put any of these in a commit, commit message, tag, push, release, release note, uploaded file or built app:**
 
-- Personal names, usernames, or email addresses. The only allowed identity is `LondonVista <londonvista@icloud.com>`.
+- Personal names, usernames, or email addresses. The owner's first name `Jacob` is allowed, but never together with a surname. Allowed git identities: `Jacob <londonvista@icloud.com>` or `LondonVista <londonvista@icloud.com>`.
 - Home-folder paths (`/Users/<name>/…`, `/home/<name>/…`, `C:\Users\<name>\…`). Write `~/…` or a relative path instead.
 - Computer names and hostnames, including git emails ending in `.local`.
 - Device identifiers: UDIDs, serial numbers, IMEIs, MAC addresses, installation IDs.
@@ -14,7 +14,7 @@ This rule applies to every AI coding tool (Claude, Grok, Antigravity/Gemini, Cod
 
 **Before every commit, push or release:**
 
-1. Confirm `git config user.name` and `git config user.email` are the identity above.
+1. Confirm `git config user.name` and `git config user.email` are one of the allowed identities above.
 2. Read the full diff, the commit message, the release notes, and the strings inside any built app, zip or dmg for the items above.
 3. Keep agent notes and local config that mention machine paths (`CLAUDE.md`, `GEMINI.md`, `.env`, local notes) out of git. They belong in `.gitignore`.
 
