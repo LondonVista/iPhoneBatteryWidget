@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.19"
+    static let appVersion = "1.0.20"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -833,7 +833,8 @@ enum MacBatteryReader {
         var tempC = lastTempC
         if let rawT = asInt(packData["Temperature"]) ?? asInt(packData["VirtualTemperature"]) ?? asInt(battData["Temperature"]) {
             let raw = Double(rawT)
-            tempC = raw > 100 ? (raw / 100.0 * 10).rounded() / 10 : raw
+            let packC = raw > 100 ? (raw / 100.0 * 10).rounded() / 10 : raw
+            tempC = LiveBatteryThermometer.reading(near: packC) ?? packC
             lastTempC = tempC
         }
 
@@ -1220,6 +1221,63 @@ enum CoconutBatteryArchiveReader {
     }
 }
 
+
+// MARK: - Live battery thermistor (HID sensor hub)
+
+@_silgen_name("IOHIDEventSystemClientCreate")
+private func hidClientCreate(_ allocator: CFAllocator?) -> Unmanaged<AnyObject>?
+@_silgen_name("IOHIDEventSystemClientSetMatching")
+private func hidClientSetMatching(_ client: AnyObject, _ matching: CFDictionary) -> Int32
+@_silgen_name("IOHIDEventSystemClientCopyServices")
+private func hidClientCopyServices(_ client: AnyObject) -> Unmanaged<CFArray>?
+@_silgen_name("IOHIDServiceClientCopyProperty")
+private func hidServiceCopyProperty(_ service: AnyObject, _ key: CFString) -> Unmanaged<AnyObject>?
+@_silgen_name("IOHIDServiceClientCopyEvent")
+private func hidServiceCopyEvent(_ service: AnyObject, _ type: Int64, _ options: Int32, _ timestamp: Int64) -> Unmanaged<AnyObject>?
+@_silgen_name("IOHIDEventGetFloatValue")
+private func hidEventGetFloatValue(_ event: AnyObject, _ field: Int32) -> Double
+
+/// The pack's own `Temperature` refreshes about once a minute and trails by ~1 °C.
+/// The "gas gauge battery" HID sensors update every few seconds in 0.1 °C steps.
+enum LiveBatteryThermometer {
+    private static let lock = NSLock()
+    private static var client: AnyObject?
+    private static var gauges: [AnyObject] = []
+
+    private static let temperatureEvent: Int64 = 15            // kIOHIDEventTypeTemperature
+    private static let temperatureField: Int32 = 15 << 16      // kIOHIDEventFieldTemperatureLevel
+
+    /// The live gauge sensor nearest the pack reading, so a cooler cell or board sensor is never picked.
+    static func reading(near packC: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        if gauges.isEmpty { loadGauges() }
+        var values: [Double] = []
+        for s in gauges {
+            guard let ev = hidServiceCopyEvent(s, temperatureEvent, 0, 0)?.takeRetainedValue() else { continue }
+            let v = hidEventGetFloatValue(ev, temperatureField)
+            if v > -10 && v < 90 { values.append(v) }
+        }
+        if values.isEmpty {
+            gauges = []   // Sensors can vanish across sleep. Look them up again next time.
+            return nil
+        }
+        guard let best = values.min(by: { abs($0 - packC) < abs($1 - packC) }), abs(best - packC) <= 3 else { return nil }
+        return (best * 10).rounded() / 10
+    }
+
+    private static func loadGauges() {
+        if client == nil {
+            guard let c = hidClientCreate(kCFAllocatorDefault)?.takeRetainedValue() else { return }
+            _ = hidClientSetMatching(c, ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary)
+            client = c
+        }
+        guard let c = client, let all = hidClientCopyServices(c)?.takeRetainedValue() as? [AnyObject] else { return }
+        gauges = all.filter {
+            let name = hidServiceCopyProperty($0, "Product" as CFString)?.takeRetainedValue() as? String
+            return name?.lowercased().contains("gas gauge battery") == true
+        }
+    }
+}
 
 // MARK: - Capped subprocess (never leave a spinning child)
 
@@ -1623,6 +1681,8 @@ def run():
         rem_mah = None
         fcc_mah = None
         des_mah = None
+        reg = {}
+        live_pct = None
         
         try:
             diag_serv = send_lockdown(sock_to_use, {'Request': 'StartService', 'Service': 'com.apple.mobile.diagnostics_relay', 'Label': 'BW'})
@@ -1665,6 +1725,9 @@ def run():
                     # 2. Fallback to AppleSmartBattery for missing fields (like TimeRemaining)
                     pwr_res = send_lockdown(diag_sock, {'Request': 'IORegistry', 'EntryClass': 'AppleSmartBattery'})
                     reg = pwr_res.get('Diagnostics', {}).get('IORegistry', {})
+                    # Live gauge percent, the one the phone shows. The lockdown battery domain can stick at 100.
+                    if reg.get('MaxCapacity') == 100 and isinstance(reg.get('CurrentCapacity'), int):
+                        live_pct = reg.get('CurrentCapacity')
                     if not cycles: cycles = reg.get('CycleCount')
                     if not voltage: voltage = reg.get('Voltage')
                     if not amperage: amperage = reg.get('InstantAmperage') or reg.get('Amperage')
@@ -1724,6 +1787,7 @@ def run():
             'productType': base_info.get('ProductType', 'iPhone'),
             'serialNumber': base_info.get('SerialNumber'),
             'capacity': batt_info.get('BatteryCurrentCapacity', 0),
+            'livePct': live_pct,
             'isCharging': batt_info.get('BatteryIsCharging', False),
             'isFullyCharged': batt_info.get('FullyCharged', False),
             'isACConnected': batt_info.get('ExternalConnected', False) or batt_info.get('BatteryIsCharging', False),
@@ -1761,6 +1825,7 @@ run()
             let productVersion: String?
             let serialNumber: String?
             let capacity: Int?
+            let livePct: Int?
             let isCharging: Bool?
             let isFullyCharged: Bool?
             let isACConnected: Bool?
@@ -1781,8 +1846,10 @@ run()
             let batterySerialNumber: String?
             let uptimeSeconds: Int?
         }
-        guard let info = try? JSONDecoder().decode(NativeDevInfo.self, from: data),
-              let cap = info.capacity, cap > 0 else { return nil }
+        guard let info = try? JSONDecoder().decode(NativeDevInfo.self, from: data) else { return nil }
+        // Prefer the live IORegistry percent. Lockdown's BatteryCurrentCapacity once sat at 100 while the pack drained.
+        let livePct = info.livePct.flatMap { (1...100).contains($0) ? $0 : nil }
+        guard let cap = livePct ?? info.capacity, cap > 0 else { return nil }
         
         let pType = info.productType ?? "iPhone"
         let dType: DeviceType = pType.lowercased().contains("ipad") ? .ipad : .iphone
@@ -1939,7 +2006,7 @@ run()
         }
         let battDict = parseKV(battRaw)
         
-        guard let capStr = battDict["BatteryCurrentCapacity"], let capacityInt = Int(capStr) else { return nil }
+        guard let capStr = battDict["BatteryCurrentCapacity"], var capacityInt = Int(capStr) else { return nil }
         let isCharging = battDict["BatteryIsCharging"] == "true"
         let isFullyCharged = battDict["FullyCharged"] == "true"
         let externalConnected = battDict["ExternalConnected"] == "true"
@@ -1979,7 +2046,7 @@ run()
         }
 
         // 3. Diagnostics IOReg for Precision Battery Data
-        let capacityExact = Double(capacityInt)
+        var capacityExact = Double(capacityInt)
         var cycleCount: Int? = nil
         var voltage: Int? = nil
         var amperageMa: Int? = nil
@@ -2006,6 +2073,11 @@ run()
             if let xmlPack = run(diagTool, args: udidArgs + ["ioregentry", "AppleSmartBatteryPack"], timeout: 2.0),
                !xmlPack.isEmpty {
                 let regPack = parsePlistKeys(xmlPack)
+                // Live gauge percent wins over lockdown, which can stick at 100.
+                if regPack["MaxCapacity"] == "100", let live = regPack["CurrentCapacity"].flatMap({ Int($0) }), (1...100).contains(live) {
+                    capacityInt = live
+                    capacityExact = Double(live)
+                }
                 
                 if let tRaw = (regPack["Temperature"] ?? regPack["VirtualTemperature"]).flatMap({ Double($0) }) {
                     if tRaw > 1000 { tempC = tRaw / 100.0 }
