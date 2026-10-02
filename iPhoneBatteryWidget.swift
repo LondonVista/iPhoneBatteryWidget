@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.20"
+    static let appVersion = "1.0.21"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -1222,6 +1222,94 @@ enum CoconutBatteryArchiveReader {
 }
 
 
+// MARK: - Break reminder banner
+
+/// Stays on the widget until its ✕ is clicked. The light breathes slowly from white to green; the box never moves or resizes.
+struct BreakReminderBanner: View {
+    /// When the current lid session began. The banner shows a live h:mm:ss counter from it.
+    let sessionStart: Date?
+    let minutes: Int
+    /// Length of the session before this one today, if there was one.
+    let previousSession: TimeInterval?
+    /// All of today's finished sessions added up. The total adds the live session on top.
+    let finishedToday: TimeInterval
+    let onDismiss: () -> Void
+    @State private var glow = false
+
+    private let green = Color(hex: "#30D158")
+    private var tint: Color { glow ? green : .white }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 7) {
+            Image(systemName: "cup.and.saucer.fill")
+                .foregroundColor(tint)
+                .font(.system(size: 13, weight: .bold))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("Time for a break")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(.white)
+                    if let start = sessionStart {
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            // Fixed width and no animation: the digits change in place, nothing slides or fades.
+                            Text(Self.elapsed(from: start, to: context.date))
+                                .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                                .monospacedDigit()
+                                .foregroundColor(tint)
+                                .contentTransition(.identity)
+                                .frame(width: 58, alignment: .leading)
+                                .transaction { $0.animation = nil }
+                        }
+                    }
+                }
+                Text("Your MacBook lid has been open for \(BatteryWidgetViewModel.breakDurationText(minutes)).")
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.white.opacity(0.8))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let previous = previousSession, let start = sessionStart {
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text("Previous \(Self.hoursMinutes(previous)) · Total \(Self.hoursMinutes(finishedToday + context.date.timeIntervalSince(start)))")
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                            .transaction { $0.animation = nil }
+                    }
+                }
+                Text("Turn off: gear → Sound & Look → Break Reminder")
+                    .font(.system(size: 8.5))
+                    .foregroundColor(.white.opacity(0.45))
+            }
+            Spacer(minLength: 0)
+            Button(action: onDismiss) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.white.opacity(0.55))
+                    .font(.system(size: 13))
+            }
+            .buttonStyle(.plain)
+            .help("Dismiss")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(tint.opacity(glow ? 0.24 : 0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(tint.opacity(glow ? 0.85 : 0.35), lineWidth: 1))
+        .onAppear {
+            withAnimation(.easeInOut(duration: 3.2).repeatForever(autoreverses: true)) {
+                glow = true
+            }
+        }
+    }
+
+    static func hoursMinutes(_ seconds: TimeInterval) -> String {
+        let m = max(0, Int(seconds) / 60)
+        return m >= 60 ? "\(m / 60)h \(m % 60)m" : "\(m)m"
+    }
+
+    static func elapsed(from start: Date, to now: Date) -> String {
+        let sec = max(0, Int(now.timeIntervalSince(start)))
+        return String(format: "%d:%02d:%02d", sec / 3600, (sec % 3600) / 60, sec % 60)
+    }
+}
+
 // MARK: - Live battery thermistor (HID sensor hub)
 
 @_silgen_name("IOHIDEventSystemClientCreate")
@@ -2193,6 +2281,17 @@ run()
 
 struct LidSession: Identifiable, Codable, Equatable {
     var id: String { "\(openDate.timeIntervalSince1970)_\(closeDate?.timeIntervalSince1970 ?? 0)" }
+
+    /// One session per open time, newest first. A later entry wins, and a closed one beats an open one.
+    static func deduplicated(_ sessions: [LidSession]) -> [LidSession] {
+        var byOpen: [Int: LidSession] = [:]
+        for s in sessions {
+            let key = Int(s.openDate.timeIntervalSince1970)
+            if let kept = byOpen[key], kept.closeDate != nil, s.closeDate == nil { continue }
+            byOpen[key] = s
+        }
+        return byOpen.values.sorted(by: { $0.openDate > $1.openDate })
+    }
     let openDate: Date
     let closeDate: Date? // nil if currently open / active
     
@@ -2262,10 +2361,23 @@ final class MacLidTracker {
               let fullLog = String(data: outputData, encoding: .utf8) else {
             return []
         }
-        let output = fullLog
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .filter { $0.contains("com.apple.powermanagement.lidopen") || $0.contains("Clamshell Sleep") }
+        let allLines = fullLog.split(separator: "\n", omittingEmptySubsequences: true)
+        let output = allLines
+            .filter { $0.contains("com.apple.powermanagement.lidopen") || $0.contains("Clamshell Sleep") || $0.contains("powerd process is started") }
             .joined(separator: "\n")
+
+        // A shutdown logs nothing of its own. The last entry before each boot is when the Mac went off.
+        var shutdownBeforeBoot: [Date: Date] = [:]
+        var lastSeen: Date?
+        for line in allLines where line.hasPrefix("20") && line.count >= 19 {
+            guard let dt = df.date(from: String(line.prefix(19))) else { continue }
+            if line.contains("powerd process is started") {
+                if let last = lastSeen, last < dt { shutdownBeforeBoot[dt] = last }
+                lastSeen = nil
+            } else if lastSeen == nil || dt > lastSeen! {
+                lastSeen = dt
+            }
+        }
 
         var rawOpens: [Date] = []
         var rawCloses: [Date] = []
@@ -2275,7 +2387,9 @@ final class MacLidTracker {
             let dateStr = String(line.prefix(19))
             guard let dt = df.date(from: dateStr) else { continue }
 
-            let isOpen = line.contains("Created UserIsActive \"com.apple.powermanagement.lidopen\"") ||
+            // A cold boot logs no lidopen or wake, only powerd starting. Count it as the lid opening.
+            let isOpen = line.contains("powerd process is started") ||
+                         line.contains("Created UserIsActive \"com.apple.powermanagement.lidopen\"") ||
                          (line.contains("Wake") && (line.localizedCaseInsensitiveContains("lid") || line.contains("UserActivity")) && !line.contains("DarkWake"))
             let isClose = line.contains("Entering Sleep state due to 'Clamshell Sleep'") ||
                           (line.contains("Entering Sleep") && !rawOpens.isEmpty && !line.contains("Maintenance") && !line.contains("Sleep Service"))
@@ -2311,7 +2425,10 @@ final class MacLidTracker {
         for (idx, op) in rawOpens.enumerated() {
             let nextOp = (idx + 1 < rawOpens.count) ? rawOpens[idx + 1] : nil
             let validCloses = rawCloses.filter { $0 > op && (nextOp == nil || $0 < nextOp!) }
-            let cl = validCloses.first
+            var cl = validCloses.first
+            if cl == nil, let next = nextOp, let off = shutdownBeforeBoot.first(where: { abs($0.key.timeIntervalSince(next)) < 30 })?.value, off > op {
+                cl = off
+            }
             sessions.append(LidSession(openDate: op, closeDate: cl))
         }
 
@@ -2337,6 +2454,12 @@ final class BatteryWidgetViewModel: ObservableObject {
     @Published var showHistoryModal = false
     @Published var showSettings = false
     @Published var activeAlertBanner: String? = nil
+    /// The break reminder stays on the widget until its ✕ is clicked. macOS blocks this ad-hoc signed app's system notifications.
+    @Published var showingBreakReminder = false
+    /// Start of the lid session happening now. Set the moment the Mac wakes, cleared when it sleeps,
+    /// so a lid close ends the session at once instead of waiting for the power log.
+    @Published var liveSessionStart: Date?
+    private var isAsleep = false
     @Published var backgroundOpacity: Double = 0.48 {
         didSet {
             UserDefaults.standard.set(backgroundOpacity, forKey: "batteryWidget.bgOpacity")
@@ -2384,6 +2507,27 @@ final class BatteryWidgetViewModel: ObservableObject {
     @Published var eightyPercentAlertEnabled: Bool = true {
         didSet {
             UserDefaults.standard.set(eightyPercentAlertEnabled, forKey: "ibw.eightyPercentAlertEnabled")
+        }
+    }
+    @Published var breakReminderEnabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(breakReminderEnabled, forKey: "ibw.breakReminderEnabled")
+        }
+    }
+    /// Minutes of continuous lid-open time before the break reminder appears.
+    @Published var breakReminderMinutes: Int = 60 {
+        didSet {
+            UserDefaults.standard.set(breakReminderMinutes, forKey: "ibw.breakReminderMinutes")
+        }
+    }
+    static let breakReminderChoices = [30, 45, 60, 90, 120]
+
+    static func breakDurationText(_ minutes: Int) -> String {
+        switch minutes {
+        case 60: return "an hour"
+        case let m where m % 60 == 0: return "\(m / 60) hours"
+        case let m where m > 60: return "\(m / 60) h \(m % 60) min"
+        default: return "\(minutes) minutes"
         }
     }
     @Published var eightyPercentSoundTheme: String = "glass" {
@@ -2477,11 +2621,17 @@ final class BatteryWidgetViewModel: ObservableObject {
                 self?.timer = nil
                 self?.connectionWatcherTimer?.invalidate()
                 self?.connectionWatcherTimer = nil
+                // Lid closed: the session is over and its break reminder goes with it.
+                self?.isAsleep = true
+                self?.liveSessionStart = nil
+                self?.showingBreakReminder = false
                 self?.refreshLidSessions()
             }
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
+                self?.isAsleep = false
+                self?.liveSessionStart = Date()
                 self?.lastKnownWiredUDIDs = nil
                 self?.lastKnownAllUDIDs = nil
                 self?.startTimer()
@@ -2513,19 +2663,16 @@ final class BatteryWidgetViewModel: ObservableObject {
             
             DispatchQueue.main.async {
                 self.lidRefreshInFlight = false
-                // Merge freshSessions into persisted allLidSessions without duplicating
-                var map: [String: LidSession] = [:]
-                for s in self.allLidSessions {
-                    map[s.id] = s
-                }
-                for s in freshSessions {
-                    map[s.id] = s
-                }
-                let merged = Array(map.values).sorted(by: { $0.openDate > $1.openDate })
+                // Fresh sessions replace saved ones with the same open time, so a closed session drops its open copy.
+                let merged = LidSession.deduplicated(self.allLidSessions + freshSessions)
                 self.allLidSessions = merged
                 self.todayLidSessions = merged.filter { MacLidTracker.isDateInCurrentLidDayCycle($0.openDate) }
                 self.firstLidOpenToday = self.todayLidSessions.min(by: { $0.openDate < $1.openDate })?.openDate
                 self.saveLidSessions()
+                // At launch nothing has woken yet, so take the open session from the power log.
+                if self.liveSessionStart == nil && !self.isAsleep {
+                    self.liveSessionStart = self.currentLidSessionStart
+                }
                 if self.lidRefreshPending {
                     self.lidRefreshPending = false
                     self.refreshLidSessions()
@@ -2653,6 +2800,13 @@ final class BatteryWidgetViewModel: ObservableObject {
         } else {
             eightyPercentAlertEnabled = true
         }
+        if UserDefaults.standard.object(forKey: "ibw.breakReminderEnabled") != nil {
+            breakReminderEnabled = UserDefaults.standard.bool(forKey: "ibw.breakReminderEnabled")
+        }
+        let savedBreak = UserDefaults.standard.integer(forKey: "ibw.breakReminderMinutes")
+        if Self.breakReminderChoices.contains(savedBreak) {
+            breakReminderMinutes = savedBreak
+        }
         if UserDefaults.standard.object(forKey: "ibw.iphoneDisconnectSoundEnabled") != nil {
             iphoneDisconnectSoundEnabled = UserDefaults.standard.bool(forKey: "ibw.iphoneDisconnectSoundEnabled")
         } else {
@@ -2671,7 +2825,8 @@ final class BatteryWidgetViewModel: ObservableObject {
             pdSoundTheme = s
         }
         if let data = UserDefaults.standard.data(forKey: kLidHistoryLogKey),
-           let savedSessions = try? JSONDecoder().decode([LidSession].self, from: data) {
+           let decoded = try? JSONDecoder().decode([LidSession].self, from: data) {
+            let savedSessions = LidSession.deduplicated(decoded)
             self.allLidSessions = savedSessions
             self.todayLidSessions = savedSessions.filter { MacLidTracker.isDateInCurrentLidDayCycle($0.openDate) }
             self.firstLidOpenToday = self.todayLidSessions.min(by: { $0.openDate < $1.openDate })?.openDate
@@ -3255,6 +3410,48 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
+    private static let breakDismissedKey = "ibw.breakReminder.dismissedSession"
+
+    /// When a lid session passes `breakReminderMinutes`, the banner shows and stays, across restarts too,
+    /// until ✕ or the lid closes. ✕ hides it for that session only; the next session can show it again.
+    private func considerBreakReminder() {
+        guard breakReminderEnabled else {
+            if showingBreakReminder { showingBreakReminder = false }
+            return
+        }
+        guard !showingBreakReminder,
+              let start = liveSessionStart,
+              Date().timeIntervalSince(start) >= TimeInterval(breakReminderMinutes * 60) else { return }
+        guard UserDefaults.standard.integer(forKey: Self.breakDismissedKey) != Int(start.timeIntervalSince1970) else { return }
+        showBreakReminder()
+    }
+
+    func dismissBreakReminder() {
+        if let start = liveSessionStart {
+            UserDefaults.standard.set(Int(start.timeIntervalSince1970), forKey: Self.breakDismissedKey)
+        }
+        withAnimation { showingBreakReminder = false }
+    }
+
+    /// Today's finished sessions before the current one, newest first.
+    var finishedSessionsToday: [LidSession] {
+        let cutoff = (liveSessionStart ?? Date()).addingTimeInterval(60)
+        return todayLidSessions
+            .filter { ($0.closeDate.map { $0 <= cutoff }) ?? false }
+            .sorted { $0.openDate > $1.openDate }
+    }
+
+    /// Start of the lid session that is open right now, if any.
+    var currentLidSessionStart: Date? {
+        todayLidSessions.filter { $0.closeDate == nil }.map(\.openDate).max()
+    }
+
+    func showBreakReminder() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            showingBreakReminder = true
+        }
+    }
+
     func showPDDisconnectNotification() {
         WidgetNotificationManager.shared.post(
             title: "⚡️ USB-C Charger Disconnected",
@@ -3491,6 +3688,7 @@ final class BatteryWidgetViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.refresh(manual: false)
+                self.considerBreakReminder()
                 // Lid events come with wakes, which refresh on their own. This is only a backstop.
                 if Date().timeIntervalSince(self.lastLidSessionCheck) >= 900.0 {
                     self.lastLidSessionCheck = Date()
@@ -7624,6 +7822,40 @@ struct BatteryHistoryChartView: View {
 
             Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
 
+            // Break reminder after a chosen stretch of lid-open time
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Break Reminder")
+                            .font(.system(size: 11.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                        Text("Shows on the widget when the MacBook lid has been open for \(BatteryWidgetViewModel.breakDurationText(vm.breakReminderMinutes))")
+                            .font(.system(size: 10))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    testAudioButton {
+                        vm.showBreakReminder()
+                    }
+                    Toggle("", isOn: $vm.breakReminderEnabled)
+                        .toggleStyle(SwitchToggleStyle(tint: Color(hex: "#30D158")))
+                        .labelsHidden()
+                }
+
+                if vm.breakReminderEnabled {
+                    HStack(spacing: 5) {
+                        Text("Break after:")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.5))
+                        ForEach(BatteryWidgetViewModel.breakReminderChoices, id: \.self) { m in
+                            breakTimePill(minutes: m)
+                        }
+                    }
+                }
+            }
+
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
+
             // 1. 80% Charge Limit Ding (iPhone Only)
             VStack(alignment: .leading, spacing: 7) {
                 HStack {
@@ -7935,6 +8167,23 @@ struct BatteryHistoryChartView: View {
                     .fill(isSelected ? Color(hex: "#30D158").opacity(0.3) : Color.white.opacity(0.06))
             )
             .foregroundColor(isSelected ? Color.white : Color.white.opacity(0.7))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func breakTimePill(minutes: Int) -> some View {
+        let isSelected = vm.breakReminderMinutes == minutes
+        let title = minutes < 60 ? "\(minutes) min" : (minutes % 60 == 0 ? "\(minutes / 60) h" : String(format: "%.1f h", Double(minutes) / 60))
+        return Button(action: { vm.breakReminderMinutes = minutes }) {
+            Text(title)
+                .font(.system(size: 9.5, weight: isSelected ? .bold : .medium))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3.5)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isSelected ? Color(hex: "#30D158").opacity(0.3) : Color.white.opacity(0.06))
+                )
+                .foregroundColor(isSelected ? Color.white : Color.white.opacity(0.7))
         }
         .buttonStyle(.plain)
     }
@@ -8963,6 +9212,20 @@ struct BatteryWidgetView: View {
                 
                 Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
                     .padding(.horizontal, 10).padding(.vertical, 8)
+
+                if vm.showingBreakReminder {
+                    BreakReminderBanner(
+                        sessionStart: vm.liveSessionStart,
+                        minutes: vm.breakReminderMinutes,
+                        previousSession: vm.finishedSessionsToday.first?.durationSeconds,
+                        finishedToday: vm.finishedSessionsToday.reduce(0) { $0 + $1.durationSeconds }
+                    ) {
+                        vm.dismissBreakReminder()
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
 
                 if let alert = vm.activeAlertBanner {
                     HStack(spacing: 6) {
