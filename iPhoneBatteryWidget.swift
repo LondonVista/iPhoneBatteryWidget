@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.21"
+    static let appVersion = "1.0.22"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -853,8 +853,13 @@ enum MacBatteryReader {
 
         let isRealPDContract = extChargeCapable && ((detectedWatts ?? 0) >= 10 || (detectedV ?? 0) >= 8.5 || (1...3).contains(hvc))
 
+        // A negotiated contract is not power. AlDente-style discharge or a fault can hold 30 W / 20 V
+        // while 0 W flows in, so trust SystemPowerIn when the Mac reports it (mW, or W on some models).
+        let rawPowerIn = asInt(telemetry["SystemPowerIn"]) ?? asInt(batt["SystemPowerIn"])
+        let adapterDelivering = rawPowerIn.map { Double($0) / ($0 > 200 ? 1000.0 : 1.0) > 1.0 } ?? true
+
         // AC power connection (strictly ignores 5V / 5W accessory connections like attached iPhone)
-        let isACConnected = externalConnected && (extChargeCapable || chargingFlag || isRealPDContract)
+        let isACConnected = externalConnected && (extChargeCapable || chargingFlag || isRealPDContract) && adapterDelivering
 
         // Trust IOKit's IsCharging bit, or any real positive pack current.
         let isCharging = isACConnected && (chargingFlag || amps > 30)
@@ -1224,6 +1229,41 @@ enum CoconutBatteryArchiveReader {
 
 // MARK: - Break reminder banner
 
+/// White-to-green breathing tint and border, animated by Core Animation in the window server.
+/// A SwiftUI repeatForever animation re-rendered and re-measured the whole widget ~60 times a second.
+struct PulsingGlowBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        guard let layer = view.layer else { return view }
+        let white = NSColor.white
+        let green = NSColor(srgbRed: 0x30 / 255.0, green: 0xD1 / 255.0, blue: 0x58 / 255.0, alpha: 1)
+        layer.cornerRadius = 8
+        layer.cornerCurve = .continuous
+        layer.borderWidth = 1
+        layer.backgroundColor = white.withAlphaComponent(0.10).cgColor
+        layer.borderColor = white.withAlphaComponent(0.35).cgColor
+
+        let fill = CABasicAnimation(keyPath: "backgroundColor")
+        fill.fromValue = white.withAlphaComponent(0.10).cgColor
+        fill.toValue = green.withAlphaComponent(0.24).cgColor
+        let border = CABasicAnimation(keyPath: "borderColor")
+        border.fromValue = white.withAlphaComponent(0.35).cgColor
+        border.toValue = green.withAlphaComponent(0.85).cgColor
+
+        let pulse = CAAnimationGroup()
+        pulse.animations = [fill, border]
+        pulse.duration = 3.2
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(pulse, forKey: "pulse")
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
 /// Stays on the widget until its ✕ is clicked. The light breathes slowly from white to green; the box never moves or resizes.
 struct BreakReminderBanner: View {
     /// When the current lid session began. The banner shows a live h:mm:ss counter from it.
@@ -1234,10 +1274,7 @@ struct BreakReminderBanner: View {
     /// All of today's finished sessions added up. The total adds the live session on top.
     let finishedToday: TimeInterval
     let onDismiss: () -> Void
-    @State private var glow = false
-
-    private let green = Color(hex: "#30D158")
-    private var tint: Color { glow ? green : .white }
+    private let tint = Color(hex: "#30D158")
 
     var body: some View {
         HStack(alignment: .top, spacing: 7) {
@@ -1289,14 +1326,8 @@ struct BreakReminderBanner: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(tint.opacity(glow ? 0.24 : 0.10))
+        .background(PulsingGlowBackground())
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(tint.opacity(glow ? 0.85 : 0.35), lineWidth: 1))
-        .onAppear {
-            withAnimation(.easeInOut(duration: 3.2).repeatForever(autoreverses: true)) {
-                glow = true
-            }
-        }
     }
 
     static func hoursMinutes(_ seconds: TimeInterval) -> String {
@@ -1335,7 +1366,8 @@ enum LiveBatteryThermometer {
     private static let temperatureEvent: Int64 = 15            // kIOHIDEventTypeTemperature
     private static let temperatureField: Int32 = 15 << 16      // kIOHIDEventFieldTemperatureLevel
 
-    /// The live gauge sensor nearest the pack reading, so a cooler cell or board sensor is never picked.
+    /// The warmest live gauge within 3 °C of the pack reading. Nearest-to-pack picked a sensor that only
+    /// moves in whole degrees, because the pack value lags; the 0.1 °C sensors run warmest and lead.
     static func reading(near packC: Double) -> Double? {
         lock.lock(); defer { lock.unlock() }
         if gauges.isEmpty { loadGauges() }
@@ -1349,7 +1381,7 @@ enum LiveBatteryThermometer {
             gauges = []   // Sensors can vanish across sleep. Look them up again next time.
             return nil
         }
-        guard let best = values.min(by: { abs($0 - packC) < abs($1 - packC) }), abs(best - packC) <= 3 else { return nil }
+        guard let best = values.filter({ abs($0 - packC) <= 3 }).max() else { return nil }
         return (best * 10).rounded() / 10
     }
 
@@ -2356,34 +2388,53 @@ final class MacLidTracker {
         let startStr = df.string(from: sevenDaysAgo)
 
         // Run pmset directly, not through `sh`, so a timeout kills pmset itself.
-        // It takes about 3 s of CPU for 7 days of log, so callers must not run this often.
-        guard let (_, outputData) = CappedProcess.run("/usr/bin/pmset", args: ["-g", "log", "--start", startStr], timeout: 10.0),
-              let fullLog = String(data: outputData, encoding: .utf8) else {
+        // pmset itself takes about 3 s of CPU, so callers must not run this often.
+        guard let (_, outputData) = CappedProcess.run("/usr/bin/pmset", args: ["-g", "log", "--start", startStr], timeout: 10.0) else {
             return []
         }
-        let allLines = fullLog.split(separator: "\n", omittingEmptySubsequences: true)
-        let output = allLines
-            .filter { $0.contains("com.apple.powermanagement.lidopen") || $0.contains("Clamshell Sleep") || $0.contains("powerd process is started") }
-            .joined(separator: "\n")
 
+        // The log is ~9 MB (pmset ignores --start). Scan raw bytes with memchr/memmem and only build
+        // Strings for the few hundred matching lines; String matching over all of it cost seconds of CPU.
+        let lidNeedles = ["com.apple.powermanagement.lidopen", "Clamshell Sleep"].map { Array($0.utf8) }
+        let bootNeedle = Array("powerd process is started".utf8)
+        var output: [String] = []
         // A shutdown logs nothing of its own. The last entry before each boot is when the Mac went off.
         var shutdownBeforeBoot: [Date: Date] = [:]
-        var lastSeen: Date?
-        for line in allLines where line.hasPrefix("20") && line.count >= 19 {
-            guard let dt = df.date(from: String(line.prefix(19))) else { continue }
-            if line.contains("powerd process is started") {
-                if let last = lastSeen, last < dt { shutdownBeforeBoot[dt] = last }
-                lastSeen = nil
-            } else if lastSeen == nil || dt > lastSeen! {
-                lastSeen = dt
+        outputData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            let total = raw.count
+            // "yyyy-MM-dd HH:mm:ss" sorts correctly as bytes, so timestamps compare without parsing.
+            var lastSeen: [UInt8]?
+            var start = 0
+            while start < total {
+                let end = memchr(base + start, 0x0A, total - start).map { base.distance(to: UnsafeRawPointer($0)) } ?? total
+                let len = end - start
+                defer { start = end + 1 }
+                guard len >= 19, base.load(fromByteOffset: start, as: UInt8.self) == 0x32 else { continue }   // "2" of the year
+                let line = base + start
+                let stamp = Array(UnsafeRawBufferPointer(start: line, count: 19))
+                let isBoot = memmem(line, len, bootNeedle, bootNeedle.count) != nil
+                if isBoot {
+                    if let last = lastSeen, last.lexicographicallyPrecedes(stamp),
+                       let off = df.date(from: String(decoding: last, as: UTF8.self)),
+                       let boot = df.date(from: String(decoding: stamp, as: UTF8.self)) {
+                        shutdownBeforeBoot[boot] = off
+                    }
+                    lastSeen = nil
+                } else if lastSeen.map({ $0.lexicographicallyPrecedes(stamp) }) ?? true {
+                    lastSeen = stamp
+                }
+                if isBoot || lidNeedles.contains(where: { memmem(line, len, $0, $0.count) != nil }) {
+                    output.append(String(decoding: UnsafeRawBufferPointer(start: line, count: len), as: UTF8.self))
+                }
             }
         }
 
         var rawOpens: [Date] = []
         var rawCloses: [Date] = []
 
-        for line in output.components(separatedBy: "\n") {
-            guard line.count >= 19 else { continue }
+        for line in output {
+            guard line.utf8.count >= 19 else { continue }
             let dateStr = String(line.prefix(19))
             guard let dt = df.date(from: dateStr) else { continue }
 
@@ -2908,10 +2959,11 @@ final class BatteryWidgetViewModel: ObservableObject {
         refresh(manual: false)
     }
 
-    func refresh(manual: Bool) {
+    /// `lidSessions: false` for phone plug/unplug: those must not re-read the multi-megabyte power log.
+    func refresh(manual: Bool, lidSessions: Bool = true) {
         if manual {
             isRefreshing = true
-            refreshLidSessions()
+            if lidSessions { refreshLidSessions() }
         }
 
         // 1. Fetch Mac telemetry asynchronously and apply immediately to avoid UI stalling
@@ -3209,7 +3261,9 @@ final class BatteryWidgetViewModel: ObservableObject {
             tSamples = tSamples.filter { now.timeIntervalSince($0.date) < 1800 }
             recentTempSamples[devId] = tSamples
             
-            if let older = tSamples.first(where: { now.timeIntervalSince($0.date) >= 20 }), older.temp > 0 {
+            // Compare with the newest sample at least a minute old. `first` took the oldest one in the
+            // 30-minute window, so a warmer half-hour-ago reading showed "falling" while it was rising.
+            if let older = tSamples.last(where: { now.timeIntervalSince($0.date) >= 60 }), older.temp > 0 {
                 let diff = currentTemp - older.temp
                 if diff >= 0.12 {
                     finalTempTrend = .rising
@@ -3592,18 +3646,18 @@ final class BatteryWidgetViewModel: ObservableObject {
             if iphoneSoundEnabled {
                 playIPhoneSound()
             }
-            refresh(manual: true)
+            refresh(manual: true, lidSessions: false)
         }
         // 2. Phone physically unplugged from cable
         else if !confirmedUnwired.isEmpty && now.timeIntervalSince(lastIPhoneSoundAt) >= 2.0 {
             if iphoneDisconnectSoundEnabled {
                 playIPhoneDisconnectSound()
             }
-            refresh(manual: true)
+            refresh(manual: true, lidSessions: false)
         }
         // 3. Wireless Wi-Fi connect/disconnect transitions: update telemetry silently without audio interruption
         else if !newlyConnected.isEmpty || !confirmedDisconnected.isEmpty {
-            refresh(manual: true)
+            refresh(manual: true, lidSessions: false)
         }
     }
 
@@ -4233,6 +4287,10 @@ enum MacChargeLabel {
     static func status(_ info: DeviceBatteryData) -> (label: String, icon: String, color: Color) {
         let amps = info.amperageMa ?? 0
         let watts = info.chargingWatts ?? 0
+        // On AC but the load outruns the charger (e.g. 34 W on a 30 W adapter): the battery still drains.
+        if info.isACConnected == true && amps < -30 {
+            return ("Draining on AC", "arrow.down.circle", Color(hex: "#FF9F0A"))
+        }
         let actuallyCharging = info.isCharging || amps > 30 || watts > 0.3
         if actuallyCharging {
             return ("Charging", "bolt.fill", Color(hex: "#30D158"))
@@ -5612,14 +5670,24 @@ final class HistoryUIState: ObservableObject {
     @Published var selectedTempSection: BatteryHistoryChartView.TempChartSection = .today
     @Published var selectedCustomDateKey: String? = nil
     @Published var selectedLidSection: BatteryHistoryChartView.LidSessionSection = .today
+    @Published var selectedLidDayKey: String? = nil
+    @Published var lidWeekOffset: Int = 0
 }
 
 @MainActor
 struct BatteryHistoryChartView: View {
     @ObservedObject var vm: BatteryWidgetViewModel
     var onClose: (() -> Void)? = nil
-    @StateObject private var ui = HistoryUIState()
+    @StateObject private var ui: HistoryUIState
     @Environment(\.dismiss) var dismiss
+
+    init(vm: BatteryWidgetViewModel, initialTab: HistTab = .graph, onClose: (() -> Void)? = nil) {
+        self.vm = vm
+        self.onClose = onClose
+        let state = HistoryUIState()
+        state.activeTab = initialTab
+        self._ui = StateObject(wrappedValue: state)
+    }
 
     enum HistTab: String, CaseIterable {
         case graph        = "Charts & Health"
@@ -5692,6 +5760,8 @@ struct BatteryHistoryChartView: View {
     private var selectedTempSection: TempChartSection { get { ui.selectedTempSection } nonmutating set { ui.selectedTempSection = newValue } }
     private var selectedCustomDateKey: String? { get { ui.selectedCustomDateKey } nonmutating set { ui.selectedCustomDateKey = newValue } }
     private var selectedLidSection: LidSessionSection { get { ui.selectedLidSection } nonmutating set { ui.selectedLidSection = newValue } }
+    private var selectedLidDayKey: String? { get { ui.selectedLidDayKey } nonmutating set { ui.selectedLidDayKey = newValue } }
+    private var lidWeekOffset: Int { get { ui.lidWeekOffset } nonmutating set { ui.lidWeekOffset = newValue } }
 
     private var historyDevices: [DeviceBatteryData] {
         var mac: DeviceBatteryData?
@@ -6373,6 +6443,11 @@ struct BatteryHistoryChartView: View {
                 } else {
                     selectedDevId = vm.selectedDeviceId
                 }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("IBWOpenLidHistoryTab"))) { _ in
+            withAnimation(.easeInOut(duration: 0.2)) {
+                self.activeTab = .lidSessions
             }
         }
     }
@@ -7297,12 +7372,540 @@ struct BatteryHistoryChartView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { exportSuccess = false }
     }
 
-    // MARK: - Lid Sessions History Tab
+// MARK: - Weekly Lid & Screen Work Time Graph
+
+struct LidDayUsage: Identifiable {
+    var id: String { dateKey }
+    let dateKey: String // "yyyy-MM-dd"
+    let date: Date
+    let dayOfWeek: String // "Mon", "Tue", etc.
+    let dayNumber: String // "28 Sep", etc.
+    let fullDateString: String // "Friday, 2 Oct 2026"
+    let totalSeconds: TimeInterval
+    let sessionCount: Int
+    let sessions: [LidSession]
+    let isToday: Bool
+    let isActiveNow: Bool
+
+    var hours: Double {
+        totalSeconds / 3600.0
+    }
+
+    var formattedDuration: String {
+        let sec = Int(totalSeconds)
+        let h = sec / 3600
+        let m = (sec % 3600) / 60
+        if h > 0 {
+            return "\(h)h \(m)m"
+        } else if m > 0 {
+            return "\(m)m"
+        } else {
+            return "0m"
+        }
+    }
+
+    var compactDuration: String {
+        let sec = Int(totalSeconds)
+        let h = sec / 3600
+        let m = (sec % 3600) / 60
+        if h > 0 {
+            return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+        } else if m > 0 {
+            return "\(m)m"
+        } else {
+            return "—"
+        }
+    }
+}
+
+private struct DottedHLine: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: 0, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.width, y: rect.midY))
+        return path
+    }
+}
+
+@MainActor
+struct LidWeeklyUsageGraphView: View {
+    let allSessions: [LidSession]
+    @Binding var selectedDayKey: String?
+    @Binding var weekOffset: Int
+    @State private var hoveredDayKey: String? = nil
+
+    private func computeWeekData() -> (rangeTitle: String, days: [LidDayUsage], totalWeekSeconds: TimeInterval, dailyAvgSeconds: TimeInterval, peakDay: LidDayUsage?, activeDaysCount: Int) {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.current
+        cal.firstWeekday = 2 // Monday start
+        let now = Date()
+
+        let anchorDate: Date
+        if weekOffset == 0 {
+            anchorDate = now
+        } else {
+            anchorDate = cal.date(byAdding: .weekOfYear, value: weekOffset, to: now) ?? now
+        }
+
+        guard let interval = cal.dateInterval(of: .weekOfYear, for: anchorDate) else {
+            return ("Week", [], 0, 0, nil, 0)
+        }
+
+        let dfShort = DateFormatter()
+        dfShort.dateFormat = "d MMM"
+        dfShort.timeZone = TimeZone.current
+
+        let dfFull = DateFormatter()
+        dfFull.dateFormat = "EEEE, d MMM yyyy"
+        dfFull.timeZone = TimeZone.current
+
+        let dfDayOfWeek = DateFormatter()
+        dfDayOfWeek.dateFormat = "EEE"
+        dfDayOfWeek.timeZone = TimeZone.current
+
+        let dfKey = DateFormatter()
+        dfKey.dateFormat = "yyyy-MM-dd"
+        dfKey.timeZone = TimeZone.current
+
+        var days: [LidDayUsage] = []
+        var totalSec: TimeInterval = 0
+        var activeCount = 0
+
+        let weekStartDay = interval.start
+        let weekEndDay = cal.date(byAdding: .day, value: 6, to: weekStartDay) ?? weekStartDay
+
+        let rangeTitle: String
+        let weekLabel = weekOffset == 0 ? " (This Week)" : (weekOffset == -1 ? " (Last Week)" : "")
+        rangeTitle = "\(dfShort.string(from: weekStartDay)) – \(dfShort.string(from: weekEndDay))\(weekLabel)"
+
+        for i in 0..<7 {
+            guard let dayDate = cal.date(byAdding: .day, value: i, to: weekStartDay) else { continue }
+            let dayStart = cal.date(bySettingHour: 5, minute: 0, second: 0, of: dayDate) ?? dayDate
+            let dayEnd = cal.date(byAdding: .day, value: 1, to: dayStart) ?? dayDate
+
+            let daySessions = allSessions.filter { s in
+                s.openDate >= dayStart && s.openDate < dayEnd
+            }
+            let daySec = daySessions.reduce(0.0) { $0 + $1.durationSeconds }
+            totalSec += daySec
+            if daySec > 60 { activeCount += 1 }
+
+            let isToday = MacLidTracker.isDateInCurrentLidDayCycle(dayDate)
+            let hasActiveSession = daySessions.contains { $0.isActive }
+
+            let key = dfKey.string(from: dayDate)
+            days.append(LidDayUsage(
+                dateKey: key,
+                date: dayDate,
+                dayOfWeek: dfDayOfWeek.string(from: dayDate),
+                dayNumber: dfShort.string(from: dayDate),
+                fullDateString: dfFull.string(from: dayDate),
+                totalSeconds: daySec,
+                sessionCount: daySessions.count,
+                sessions: daySessions,
+                isToday: isToday,
+                isActiveNow: hasActiveSession
+            ))
+        }
+
+        let avgSec = activeCount > 0 ? (totalSec / Double(activeCount)) : 0
+        let peak = days.max(by: { $0.totalSeconds < $1.totalSeconds })
+        let validPeak = (peak?.totalSeconds ?? 0) > 60 ? peak : nil
+
+        return (rangeTitle, days, totalSec, avgSec, validPeak, activeCount)
+    }
+
+    var body: some View {
+        let data = computeWeekData()
+        let maxVal = max(8.0, ceil((data.days.map(\.hours).max() ?? 8.0) / 2.0) * 2.0)
+        let chartH: CGFloat = 115
+
+        VStack(spacing: 12) {
+            // Header Row: Title & Week Pagination
+            HStack(alignment: .center) {
+                HStack(spacing: 8) {
+                    Image(systemName: "chart.bar.fill")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(Color(hex: "#30D158"))
+                        .shadow(color: Color(hex: "#30D158").opacity(0.4), radius: 4)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Weekly MacBook Usage")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundColor(.white)
+                        Text("Daily screen & active lid working hours")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                }
+
+                Spacer()
+
+                // Navigation Controls
+                HStack(spacing: 6) {
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            weekOffset -= 1
+                            selectedDayKey = nil
+                        }
+                    }) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white.opacity(0.8))
+                            .frame(width: 24, height: 24)
+                            .background(Color.white.opacity(0.06))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+
+                    Text(data.rangeTitle)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.white.opacity(0.06))
+                        .clipShape(Capsule())
+                        .overlay(Capsule().stroke(Color.white.opacity(0.1), lineWidth: 1))
+
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            if weekOffset < 0 {
+                                weekOffset += 1
+                                selectedDayKey = nil
+                            }
+                        }
+                    }) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(weekOffset >= 0 ? .white.opacity(0.2) : .white.opacity(0.8))
+                            .frame(width: 24, height: 24)
+                            .background(Color.white.opacity(0.06))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(weekOffset >= 0)
+
+                    if weekOffset != 0 {
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                weekOffset = 0
+                                selectedDayKey = nil
+                            }
+                        }) {
+                            Text("Current Week")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(Color(hex: "#0A84FF"))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color(hex: "#0A84FF").opacity(0.15))
+                                .clipShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // Summary Stats Strip
+            HStack(spacing: 8) {
+                statPill(
+                    icon: "clock.fill",
+                    iconColor: "#30D158",
+                    title: "Week Total",
+                    value: formatSecondsToHours(data.totalWeekSeconds)
+                )
+                statPill(
+                    icon: "chart.bar.xaxis",
+                    iconColor: "#0A84FF",
+                    title: "Daily Average",
+                    value: data.activeDaysCount > 0 ? "\(formatSecondsToHours(data.dailyAvgSeconds))/day" : "—"
+                )
+                statPill(
+                    icon: "flame.fill",
+                    iconColor: "#FF9F0A",
+                    title: "Peak Day",
+                    value: data.peakDay != nil ? "\(data.peakDay!.dayOfWeek) (\(data.peakDay!.compactDuration))" : "—"
+                )
+                statPill(
+                    icon: "calendar.badge.clock",
+                    iconColor: "#BF5AF2",
+                    title: "Days Worked",
+                    value: "\(data.activeDaysCount) of 7 days"
+                )
+            }
+
+            // Graph Area with Y-Axis and 7 Day Columns
+            HStack(alignment: .bottom, spacing: 6) {
+                // Y-Axis Reference Labels
+                VStack(alignment: .trailing, spacing: 0) {
+                    Text(String(format: "%.0fh", maxVal))
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                    Spacer()
+                    Text(String(format: "%.0fh", maxVal * 0.66))
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                    Spacer()
+                    Text(String(format: "%.0fh", maxVal * 0.33))
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                    Spacer()
+                    Text("0h")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                }
+                .frame(width: 26, height: chartH)
+                .padding(.bottom, 48)
+
+                // Chart Columns Overlayed with Dotted Guidelines
+                ZStack(alignment: .bottom) {
+                    // Dotted Reference Lines
+                    VStack(spacing: 0) {
+                        dottedLine
+                        Spacer()
+                        dottedLine
+                        Spacer()
+                        dottedLine
+                        Spacer()
+                        Rectangle()
+                            .fill(Color.white.opacity(0.12))
+                            .frame(height: 1)
+                    }
+                    .frame(height: chartH)
+                    .padding(.bottom, 48)
+
+                    // 7 Daily Columns
+                    HStack(spacing: 8) {
+                        ForEach(data.days) { day in
+                            dayColumn(day: day, maxVal: maxVal, chartH: chartH)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 4)
+
+            // Optional Filter Indicator Banner
+            if let selectedKey = selectedDayKey, let selectedDay = data.days.first(where: { $0.dateKey == selectedKey }) {
+                HStack(spacing: 8) {
+                    Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color(hex: "#0A84FF"))
+
+                    Text("Showing sessions for **\(selectedDay.fullDateString)**: \(selectedDay.formattedDuration) (\(selectedDay.sessionCount) session\(selectedDay.sessionCount == 1 ? "" : "s"))")
+                        .font(.system(size: 11))
+                        .foregroundColor(.white.opacity(0.9))
+
+                    Spacer()
+
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            selectedDayKey = nil
+                        }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 10))
+                            Text("Show All Sessions")
+                                .font(.system(size: 10.5, weight: .bold))
+                        }
+                        .foregroundColor(.white.opacity(0.75))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color(hex: "#0A84FF").opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color(hex: "#0A84FF").opacity(0.3), lineWidth: 1)
+                )
+            }
+        }
+        .padding(14)
+        .background(Color.white.opacity(0.035))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
+    private var dottedLine: some View {
+        DottedHLine()
+            .stroke(Color.white.opacity(0.08), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+            .frame(height: 1)
+    }
+
+    private func statPill(icon: String, iconColor: String, title: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(Color(hex: iconColor))
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white.opacity(0.5))
+                Text(value)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    private func dayColumn(day: LidDayUsage, maxVal: Double, chartH: CGFloat) -> some View {
+        let isSelected = selectedDayKey == day.dateKey
+        let isHovered = hoveredDayKey == day.dateKey
+        let barRatio = CGFloat(min(1.0, max(0.0, day.hours / maxVal)))
+        let barHeight = max(day.hours > 0 ? 5.0 : 0.0, barRatio * chartH)
+
+        return Button(action: {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                if selectedDayKey == day.dateKey {
+                    selectedDayKey = nil
+                } else {
+                    selectedDayKey = day.dateKey
+                }
+            }
+        }) {
+            VStack(spacing: 6) {
+                // Top duration label
+                HStack(spacing: 3) {
+                    if day.isActiveNow {
+                        Circle()
+                            .fill(Color(hex: "#30D158"))
+                            .frame(width: 5, height: 5)
+                            .shadow(color: Color(hex: "#30D158"), radius: 3)
+                    }
+                    Text(day.compactDuration)
+                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                        .foregroundColor(
+                            day.isActiveNow ? Color(hex: "#30D158") :
+                            (day.isToday ? Color(hex: "#30D158") :
+                            (day.hours > 0 ? Color(hex: "#64D2FF") : Color.white.opacity(0.25)))
+                        )
+                }
+                .frame(height: 16)
+
+                // Bar Slot
+                ZStack(alignment: .bottom) {
+                    // Track background
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(isHovered ? 0.07 : 0.035))
+                        .frame(width: 38, height: chartH)
+
+                    // Fill Bar
+                    if barHeight > 0 {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(
+                                isSelected ?
+                                    LinearGradient(colors: [Color(hex: "#30D158"), Color(hex: "#64D2FF")], startPoint: .top, endPoint: .bottom) :
+                                (day.isToday ?
+                                    LinearGradient(colors: [Color(hex: "#30D158"), Color(hex: "#0A84FF")], startPoint: .top, endPoint: .bottom) :
+                                    LinearGradient(colors: [Color(hex: "#0A84FF"), Color(hex: "#64D2FF").opacity(0.85)], startPoint: .top, endPoint: .bottom))
+                            )
+                            .frame(width: 38, height: barHeight)
+                            .shadow(
+                                color: (isSelected || day.isToday) ? Color(hex: "#30D158").opacity(0.4) : Color(hex: "#0A84FF").opacity(0.2),
+                                radius: isSelected ? 6 : 3
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    .stroke(isSelected ? Color.white : Color.clear, lineWidth: 1.5)
+                            )
+                    }
+                }
+                .frame(width: 38, height: chartH)
+
+                // Bottom Day & Date Labels
+                VStack(spacing: 2) {
+                    Text(day.dayOfWeek)
+                        .font(.system(size: 11, weight: day.isToday ? .heavy : .semibold, design: .rounded))
+                        .foregroundColor(day.isToday ? Color(hex: "#30D158") : Color.white.opacity(0.9))
+
+                    Text(day.dayNumber)
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundColor(day.isToday ? Color(hex: "#30D158").opacity(0.8) : Color.white.opacity(0.45))
+
+                    if day.isToday {
+                        Text("TODAY")
+                            .font(.system(size: 7.5, weight: .heavy))
+                            .foregroundColor(Color(hex: "#30D158"))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color(hex: "#30D158").opacity(0.16))
+                            .clipShape(Capsule())
+                    } else if day.sessionCount > 0 {
+                        Text("\(day.sessionCount) sess")
+                            .font(.system(size: 8, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.35))
+                    } else {
+                        Text("off")
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundColor(.white.opacity(0.18))
+                    }
+                }
+                .frame(height: 38)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? Color(hex: "#0A84FF").opacity(0.15) : (isHovered ? Color.white.opacity(0.05) : Color.clear))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(isSelected ? Color(hex: "#0A84FF").opacity(0.5) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hov in
+            hoveredDayKey = hov ? day.dateKey : nil
+        }
+    }
+
+    private func formatSecondsToHours(_ seconds: TimeInterval) -> String {
+        let sec = Int(seconds)
+        let h = sec / 3600
+        let m = (sec % 3600) / 60
+        if h > 0 {
+            return "\(h)h \(m)m"
+        }
+        return "\(m)m"
+    }
+}
+
+// MARK: - Lid Sessions History Tab
 
     private var filteredLidSessions: [LidSession] {
         let cal = Calendar.current
         let now = Date()
         let all = vm.allLidSessions.isEmpty ? vm.todayLidSessions : vm.allLidSessions
+
+        if let selectedKey = selectedLidDayKey {
+            let dfKey = DateFormatter()
+            dfKey.dateFormat = "yyyy-MM-dd"
+            dfKey.timeZone = TimeZone.current
+
+            return all.filter { session in
+                let cycleStart = MacLidTracker.lidCycleStartDate(for: session.openDate)
+                return dfKey.string(from: cycleStart) == selectedKey
+            }
+        }
 
         switch selectedLidSection {
         case .today:
@@ -7327,6 +7930,13 @@ struct BatteryHistoryChartView: View {
     private var lidSessionsFullView: some View {
         VStack(spacing: 12) {
             lidSectionTabBar
+
+            LidWeeklyUsageGraphView(
+                allSessions: vm.allLidSessions.isEmpty ? vm.todayLidSessions : vm.allLidSessions,
+                selectedDayKey: $ui.selectedLidDayKey,
+                weekOffset: $ui.lidWeekOffset
+            )
+
             lidSessionsSummaryCards
             lidSessionsTable
         }
@@ -7335,7 +7945,7 @@ struct BatteryHistoryChartView: View {
     private var lidSectionTabBar: some View {
         HStack(spacing: 6) {
             ForEach(LidSessionSection.allCases, id: \.self) { sec in
-                lidSectionButton(section: sec, isSelected: selectedLidSection == sec)
+                lidSectionButton(section: sec, isSelected: selectedLidSection == sec && selectedLidDayKey == nil)
             }
             Spacer()
         }
@@ -7345,6 +7955,7 @@ struct BatteryHistoryChartView: View {
     private func lidSectionButton(section: LidSessionSection, isSelected: Bool) -> some View {
         Button {
             withAnimation(.easeInOut(duration: 0.15)) {
+                self.selectedLidDayKey = nil
                 self.selectedLidSection = section
             }
         } label: {
@@ -7373,6 +7984,7 @@ struct BatteryHistoryChartView: View {
         let sec = Int(list.reduce(0) { $0 + $1.durationSeconds })
         let h = sec / 3600
         let m = (sec % 3600) / 60
+        let isFilteredDay = selectedLidDayKey != nil
 
         return HStack(spacing: 12) {
             // Card 1: First Lid Open
@@ -7381,11 +7993,11 @@ struct BatteryHistoryChartView: View {
                     Image(systemName: "sunrise.fill")
                         .font(.system(size: 10))
                         .foregroundColor(Color(hex: "#FF9F0A"))
-                    Text(selectedLidSection == .today ? "First Open Today" : "Earliest Open")
+                    Text(isFilteredDay ? "First Open (Selected Day)" : (selectedLidSection == .today ? "First Open Today" : "Earliest Open"))
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.white.opacity(0.55))
                 }
-                Text(firstOpen != nil ? (selectedLidSection == .today || selectedLidSection == .yesterday ? formatTimeFull(firstOpen!) : formatDateCoconut(firstOpen!)) : "--:--:--")
+                Text(firstOpen != nil ? (isFilteredDay || selectedLidSection == .today || selectedLidSection == .yesterday ? formatTimeFull(firstOpen!) : formatDateCoconut(firstOpen!)) : "--:--:--")
                     .font(.system(size: 14, weight: .bold, design: .monospaced))
                     .foregroundColor(.white)
             }
@@ -7401,7 +8013,7 @@ struct BatteryHistoryChartView: View {
                     Image(systemName: "clock.fill")
                         .font(.system(size: 10))
                         .foregroundColor(Color(hex: "#30D158"))
-                    Text("Total Screen / Lid Time")
+                    Text(isFilteredDay ? "Day Screen Time" : "Total Screen / Lid Time")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.white.opacity(0.55))
                 }
@@ -7421,7 +8033,7 @@ struct BatteryHistoryChartView: View {
                     Image(systemName: "laptopcomputer")
                         .font(.system(size: 10))
                         .foregroundColor(Color(hex: "#0A84FF"))
-                    Text("\(selectedLidSection.rawValue) Sessions")
+                    Text(isFilteredDay ? "Day Sessions" : "\(selectedLidSection.rawValue) Sessions")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(.white.opacity(0.55))
                 }
@@ -7439,7 +8051,7 @@ struct BatteryHistoryChartView: View {
 
     private var lidSessionsTable: some View {
         let list = filteredLidSessions
-        let isMultiDay = selectedLidSection != .today && selectedLidSection != .yesterday
+        let isMultiDay = selectedLidDayKey == nil && selectedLidSection != .today && selectedLidSection != .yesterday
 
         return VStack(spacing: 0) {
             HStack(spacing: 0) {
@@ -8557,6 +9169,30 @@ struct LidSessionsPopoverView: View {
                 }
                 .padding(.top, 2)
             }
+
+            Divider().background(Color.white.opacity(0.12)).padding(.top, 2)
+
+            Button(action: {
+                NotificationCenter.default.post(name: NSNotification.Name("IBWOpenLidHistoryTab"), object: nil)
+            }) {
+                HStack(spacing: 5) {
+                    Image(systemName: "chart.bar.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color(hex: "#30D158"))
+                    Text("Weekly Usage Graph")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(Color(hex: "#0A84FF"))
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(Color(hex: "#0A84FF").opacity(0.8))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color(hex: "#0A84FF").opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            .buttonStyle(.plain)
         }
         .padding(12)
         .frame(width: 270)
@@ -8645,6 +9281,11 @@ struct DeviceGridCardView: View {
     }
 
     private var rateAndPowerString: (text: String, isDischarge: Bool)? {
+        // Mac watts are signed battery power (volts × amps): negative means the battery is draining.
+        if dev.deviceType == .mac || dev.deviceId == "local_mac" {
+            guard let w = dev.chargingWatts, abs(w) > 0.05 else { return nil }
+            return (String(format: "%@%.1f W", w < 0 ? "-" : "+", abs(w)), w < 0)
+        }
         let isDischarge = !dev.isCharging && dev.isACConnected != true
         let prefix = isDischarge ? "-" : "+"
         
@@ -8901,10 +9542,12 @@ struct DeviceGridCardView: View {
         }
 
         if (dev.deviceType == .mac || dev.deviceId == "local_mac"), let pdOn = dev.pdHandshakeOn {
+            // Contract up but nothing flowing in (charge tool discharge, fault): say so in orange.
+            let noPower = pdOn && dev.isACConnected != true
             HStack {
                 HStack(spacing: 3.5) {
                     Circle()
-                        .fill(pdOn ? Color(hex: "#30D158") : Color(hex: "#FF453A"))
+                        .fill(noPower ? Color(hex: "#FF9F0A") : (pdOn ? Color(hex: "#30D158") : Color(hex: "#FF453A")))
                         .frame(width: 6, height: 6)
                     Text("USB-PD")
                         .font(.system(size: 9, weight: .medium))
@@ -8912,10 +9555,16 @@ struct DeviceGridCardView: View {
                 }
                 Spacer()
                 HStack(spacing: 4) {
-                    Text(pdOn ? "ON" : "OFF")
-                        .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
-                        .foregroundColor(pdOn ? Color(hex: "#30D158") : Color(hex: "#FF453A"))
-                    if pdOn, let w = dev.pdPowerLabel {
+                    if noPower {
+                        Text("0 W in")
+                            .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
+                            .foregroundColor(Color(hex: "#FF9F0A"))
+                    } else {
+                        Text(pdOn ? "ON" : "OFF")
+                            .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
+                            .foregroundColor(pdOn ? Color(hex: "#30D158") : Color(hex: "#FF453A"))
+                    }
+                    if pdOn, !noPower, let w = dev.pdPowerLabel {
                         Text(w)
                             .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                             .foregroundColor(.white.opacity(0.85))
@@ -9376,6 +10025,12 @@ final class SettingsWindow: NSWindow {
         NSApp.setActivationPolicy(.regular)
         vm = BatteryWidgetViewModel()
         buildPanel()
+
+        NotificationCenter.default.addObserver(forName: NSNotification.Name("IBWOpenLidHistoryTab"), object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.openHistoryWindow(initialTab: .lidSessions)
+            }
+        }
     }
 
     func toggleHistoryWindow() {
@@ -9421,7 +10076,14 @@ final class SettingsWindow: NSWindow {
         hp.makeKeyAndOrderFront(nil)
     }
 
-    func openHistoryWindow() {
+    func openHistoryWindow(initialTab: BatteryHistoryChartView.HistTab = .graph) {
+        if let hp = historyPanel {
+            raiseHistoryWindow(hp)
+            if initialTab != .graph {
+                NotificationCenter.default.post(name: NSNotification.Name("IBWOpenLidHistoryTab"), object: nil)
+            }
+            return
+        }
         
         guard let p = self.panel else { return }
         let screen = p.screen ?? NSScreen.main ?? NSScreen.screens.first
@@ -9433,6 +10095,7 @@ final class SettingsWindow: NSWindow {
         
         let historyView = BatteryHistoryChartView(
             vm: vm,
+            initialTab: initialTab,
             onClose: { [weak self] in
                 self?.historyPanel?.orderOut(nil)
                 self?.historyPanel = nil
