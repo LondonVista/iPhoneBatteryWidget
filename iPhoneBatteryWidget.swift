@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.22"
+    static let appVersion = "1.0.23"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -161,6 +161,16 @@ private let kFrameOriginX = "ibw.frameOriginX"
 private let kFrameTopY    = "ibw.frameTopY"
 private let kCachedDevicesKey = "ibw.cachedDevicesData.v2"
 private let kHistoryLogKey = "ibw.batteryHistoryLog.v2"
+/// History lives in its own file. In UserDefaults the ~9 MB blob stayed in memory and the
+/// whole plist was rewritten on every save.
+private let historyFileURL: URL = {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+    return base.appendingPathComponent("iPhoneBatteryWidget", isDirectory: true)
+        .appendingPathComponent("history.json")
+}()
+/// Routine history saves wait at least this long. Sleep, quit and edits save at once.
+private let kHistorySaveInterval: TimeInterval = 300
 private let persistQueue = DispatchQueue(label: "ibw.persist", qos: .utility)
 private let kLidHistoryLogKey = "ibw.lidHistoryLog.v1"
 private let kSelectedTabKey = "ibw.selectedDeviceTab"
@@ -2629,6 +2639,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var lastIOSDevices: [DeviceBatteryData] = []
     private var lastUDIDs: [(String, Bool)] = []
     private var historyDirty = false
+    private var lastHistorySaveAt: Date?
     private var lastPDHandshakeOn: Bool?
     private var pdAlertArmed = false
     private var pdDisconnectPending: Date? = nil
@@ -2676,6 +2687,7 @@ final class BatteryWidgetViewModel: ObservableObject {
                 self?.isAsleep = true
                 self?.liveSessionStart = nil
                 self?.showingBreakReminder = false
+                self?.savePersisted()
                 self?.refreshLidSessions()
             }
         }
@@ -2760,7 +2772,11 @@ final class BatteryWidgetViewModel: ObservableObject {
             }
         }
         let filePoints = CoconutBatteryArchiveReader.importHistoricalPoints()
-        if let data = UserDefaults.standard.data(forKey: kHistoryLogKey),
+        // Older builds kept the history in UserDefaults. Read it once, then the file takes over.
+        let fileData = try? Data(contentsOf: historyFileURL)
+        let legacyData = fileData == nil ? UserDefaults.standard.data(forKey: kHistoryLogKey) : nil
+        if legacyData != nil { historyDirty = true }
+        if let data = fileData ?? legacyData,
            let logs = try? JSONDecoder().decode([BatteryHistoryPoint].self, from: data),
            !logs.isEmpty {
             // Strip any legacy placeholder temperatures before 11 September 2026 (timestamp 1789084800)
@@ -2912,7 +2928,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     /// Pass `waitUntilDone` at quit. Otherwise the history write can be cut off.
     func savePersisted(waitUntilDone: Bool = false) {
         saveDevices()
-        saveHistory()
+        saveHistory(force: true)
         if waitUntilDone {
             persistQueue.sync {}
         }
@@ -2928,14 +2944,25 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
-    private func saveHistory() {
+    private func saveHistory(force: Bool = false) {
         guard historyDirty else { return }
+        let now = Date()
+        if !force, let last = lastHistorySaveAt, now.timeIntervalSince(last) < kHistorySaveInterval { return }
+        lastHistorySaveAt = now
         historyDirty = false
         let pts = historyPoints
         // One serial queue keeps writes in order, so an older snapshot never lands last.
         persistQueue.async {
-            if let data = try? JSONEncoder().encode(pts) {
-                UserDefaults.standard.set(data, forKey: kHistoryLogKey)
+            guard let data = try? JSONEncoder().encode(pts) else { return }
+            do {
+                try FileManager.default.createDirectory(at: historyFileURL.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                try data.write(to: historyFileURL, options: .atomic)
+                if UserDefaults.standard.object(forKey: kHistoryLogKey) != nil {
+                    UserDefaults.standard.removeObject(forKey: kHistoryLogKey)
+                }
+            } catch {
+                NSLog("iPhoneBatteryWidget: history save failed: \(error.localizedDescription)")
             }
         }
     }
@@ -2947,7 +2974,7 @@ final class BatteryWidgetViewModel: ObservableObject {
             historyPoints = kept
         }
         historyDirty = true
-        saveHistory()
+        saveHistory(force: true)
     }
 
     func selectTab(_ id: String) {
