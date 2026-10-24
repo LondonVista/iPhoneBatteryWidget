@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.23"
+    static let appVersion = "1.0.24"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -373,6 +373,99 @@ struct BatteryHistoryPoint: Codable, Identifiable, Equatable {
     var appVersion: String? = nil
     var batterySerial: String? = nil
     var deviceSerial: String? = nil
+}
+
+/// On-disk history format. Device details that rarely change are stored once per profile,
+/// and each reading keeps only what changes. About 5x smaller than one full record per reading.
+enum HistoryFileCodec {
+    private struct Profile: Codable, Hashable {
+        var deviceId: String
+        var deviceName: String?
+        var deviceType: DeviceType?
+        var designCapacityMah: Int?
+        var batteryManufactureDate: Date?
+        var deviceManufactureDate: Date?
+        var firstUseDate: Date?
+        var deviceModel: String?
+        var osVersion: String?
+        var appVersion: String?
+        var batterySerial: String?
+        var deviceSerial: String?
+    }
+
+    private struct Reading: Codable {
+        var p: Int          // profile index
+        var t: Double       // seconds since 1970
+        var b: Double       // battery %
+        var h: Double?      // health %
+        var c: Int?         // cycle count
+        var m: Int?         // remaining mAh
+        var f: Int?         // full charge mAh
+        var k: Double?      // temperature °C
+        var ch: Bool?       // charging
+        var ac: Bool?       // on AC
+        var w: Double?      // charging watts
+    }
+
+    private struct File: Codable {
+        var v: Int
+        var profiles: [Profile]
+        var readings: [Reading]
+    }
+
+    private static func round(_ x: Double, _ places: Double) -> Double {
+        (x * places).rounded() / places
+    }
+
+    static func encode(_ points: [BatteryHistoryPoint]) -> Data? {
+        var profiles: [Profile] = []
+        var index: [Profile: Int] = [:]
+        var readings: [Reading] = []
+        readings.reserveCapacity(points.count)
+        for pt in points {
+            let prof = Profile(deviceId: pt.deviceId, deviceName: pt.deviceName, deviceType: pt.deviceType,
+                               designCapacityMah: pt.designCapacityMah,
+                               batteryManufactureDate: pt.batteryManufactureDate,
+                               deviceManufactureDate: pt.deviceManufactureDate, firstUseDate: pt.firstUseDate,
+                               deviceModel: pt.deviceModel, osVersion: pt.osVersion, appVersion: pt.appVersion,
+                               batterySerial: pt.batterySerial, deviceSerial: pt.deviceSerial)
+            let pi: Int
+            if let known = index[prof] {
+                pi = known
+            } else {
+                pi = profiles.count
+                profiles.append(prof)
+                index[prof] = pi
+            }
+            readings.append(Reading(p: pi, t: round(pt.date.timeIntervalSince1970, 1000),
+                                    b: round(pt.batteryPct, 100), h: pt.healthPct.map { round($0, 100) },
+                                    c: pt.cycleCount, m: pt.capacityMah, f: pt.fullChargeMah,
+                                    k: pt.temperatureC.map { round($0, 100) }, ch: pt.isCharging,
+                                    ac: pt.isACConnected, w: pt.chargingWatts.map { round($0, 100) }))
+        }
+        return try? JSONEncoder().encode(File(v: 2, profiles: profiles, readings: readings))
+    }
+
+    /// Reads this format, or the plain array that v1.0.23 and UserDefaults used.
+    static func decode(_ data: Data) -> [BatteryHistoryPoint]? {
+        if let file = try? JSONDecoder().decode(File.self, from: data) {
+            return file.readings.compactMap { r in
+                guard file.profiles.indices.contains(r.p) else { return nil }
+                let prof = file.profiles[r.p]
+                return BatteryHistoryPoint(
+                    deviceId: prof.deviceId, deviceName: prof.deviceName, deviceType: prof.deviceType,
+                    date: Date(timeIntervalSince1970: r.t), batteryPct: r.b, healthPct: r.h,
+                    cycleCount: r.c, capacityMah: r.m, fullChargeMah: r.f,
+                    designCapacityMah: prof.designCapacityMah, temperatureC: r.k,
+                    batteryManufactureDate: prof.batteryManufactureDate,
+                    deviceManufactureDate: prof.deviceManufactureDate, firstUseDate: prof.firstUseDate,
+                    isCharging: r.ch, isACConnected: r.ac, chargingWatts: r.w,
+                    deviceModel: prof.deviceModel, osVersion: prof.osVersion, appVersion: prof.appVersion,
+                    batterySerial: prof.batterySerial, deviceSerial: prof.deviceSerial)
+            }
+        }
+        return try? JSONDecoder().decode([BatteryHistoryPoint].self, from: data)
+    }
 }
 
 // MARK: - Apple Model Release Database & Age
@@ -2640,6 +2733,7 @@ final class BatteryWidgetViewModel: ObservableObject {
     private var lastUDIDs: [(String, Bool)] = []
     private var historyDirty = false
     private var lastHistorySaveAt: Date?
+    private var lastHistoryThinAt: Date?
     private var lastPDHandshakeOn: Bool?
     private var pdAlertArmed = false
     private var pdDisconnectPending: Date? = nil
@@ -2777,7 +2871,7 @@ final class BatteryWidgetViewModel: ObservableObject {
         let legacyData = fileData == nil ? UserDefaults.standard.data(forKey: kHistoryLogKey) : nil
         if legacyData != nil { historyDirty = true }
         if let data = fileData ?? legacyData,
-           let logs = try? JSONDecoder().decode([BatteryHistoryPoint].self, from: data),
+           let logs = HistoryFileCodec.decode(data),
            !logs.isEmpty {
             // Strip any legacy placeholder temperatures before 11 September 2026 (timestamp 1789084800)
             let cleanedLogs = logs.map { pt -> BatteryHistoryPoint in
@@ -2950,10 +3044,11 @@ final class BatteryWidgetViewModel: ObservableObject {
         if !force, let last = lastHistorySaveAt, now.timeIntervalSince(last) < kHistorySaveInterval { return }
         lastHistorySaveAt = now
         historyDirty = false
+        thinOldHistoryIfDue(now: now)
         let pts = historyPoints
         // One serial queue keeps writes in order, so an older snapshot never lands last.
         persistQueue.async {
-            guard let data = try? JSONEncoder().encode(pts) else { return }
+            guard let data = HistoryFileCodec.encode(pts) else { return }
             do {
                 try FileManager.default.createDirectory(at: historyFileURL.deletingLastPathComponent(),
                                                         withIntermediateDirectories: true)
@@ -3378,10 +3473,13 @@ final class BatteryWidgetViewModel: ObservableObject {
         let shouldRecord: Bool
         if let recent = recent {
             let elapsed = abs(recent.date.timeIntervalSinceNow)
-            let tempChanged = abs((recent.temperatureC ?? 0) - (dev.temperatureC ?? 0)) >= 0.3
-            let pctChanged = abs(recent.batteryPct - dev.capacityExact) >= 0.5
+            // The live sensor reads in 0.1 °C steps, so a small threshold logged every wobble.
+            let tempChanged = abs((recent.temperatureC ?? 0) - (dev.temperatureC ?? 0)) >= 1.0
+            let pctChanged = abs(recent.batteryPct - dev.capacityExact) >= 1.0
             let stateChanged = (recent.isCharging != dev.isCharging) || (recent.isACConnected != dev.isACConnected)
-            shouldRecord = elapsed >= 180 || (elapsed >= 30 && (tempChanged || pctChanged || stateChanged))
+            shouldRecord = elapsed >= 300
+                || (elapsed >= 30 && stateChanged)
+                || (elapsed >= 60 && (tempChanged || pctChanged))
         } else {
             shouldRecord = true
         }
@@ -3419,9 +3517,40 @@ final class BatteryWidgetViewModel: ObservableObject {
         }
     }
 
+    /// Readings older than 30 days keep one per device per hour. Charts over months look the same.
+    /// The iPhone 15 archive is left alone, because it is re-imported from its files at launch.
+    private func thinOldHistoryIfDue(now: Date) {
+        if let last = lastHistoryThinAt, now.timeIntervalSince(last) < 6 * 3600 { return }
+        lastHistoryThinAt = now
+        let cutoff = now.addingTimeInterval(-30 * 86400)
+        guard historyPoints.contains(where: { $0.date < cutoff }) else { return }
+        var seenHours = Set<String>()
+        var kept: [BatteryHistoryPoint] = []
+        kept.reserveCapacity(historyPoints.count)
+        for pt in historyPoints {
+            if pt.date >= cutoff {
+                kept.append(pt)
+                continue
+            }
+            let group = phoneGroupKey(deviceId: pt.deviceId, serial: pt.deviceSerial, name: pt.deviceName, model: pt.deviceModel)
+            if group == "iphone-15" {
+                kept.append(pt)
+                continue
+            }
+            let hour = Int(pt.date.timeIntervalSince1970 / 3600)
+            if seenHours.insert("\(group)#\(hour)").inserted {
+                kept.append(pt)
+            }
+        }
+        if kept.count != historyPoints.count {
+            historyPoints = kept
+        }
+    }
+
+    /// Safety net only. Thinning keeps the log well under this.
     /// Keep every phone. The Mac gives up old samples first. The iPhone 15 archive is left alone.
     private func trimHistoryKeepingEveryPhone() {
-        let cap = 20000
+        let cap = 50000
         let macFloor = 2500
         guard historyPoints.count > cap else { return }
         var pts = historyPoints.sorted(by: { $0.date < $1.date })
