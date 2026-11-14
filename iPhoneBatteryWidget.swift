@@ -13,7 +13,7 @@ import Combine
 // MARK: - Config & Storage Keys
 
 enum iPhoneBatteryWidgetConfig {
-    static let appVersion = "1.0.24"
+    static let appVersion = "1.0.25"
     static let donateURL = URL(string: "https://ko-fi.com/london_vista")
     static let githubReleasesURL = URL(string: "https://github.com/LondonVista/iPhoneBatteryWidget/releases/latest")
     static let githubAPIURL = URL(string: "https://api.github.com/repos/LondonVista/iPhoneBatteryWidget/releases/latest")
@@ -471,14 +471,14 @@ enum HistoryFileCodec {
 // MARK: - Apple Model Release Database & Age
 
 enum AppleModelDatabase {
-    static func lookupReleaseDate(model: String) -> (marketingName: String, releaseDate: Date)? {
-        let clean = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        
+    private static let releaseDateTable: [String: (marketingName: String, releaseDate: Date)] = {
         let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.calendar = Calendar(identifier: .gregorian)
         df.dateFormat = "yyyy-MM-dd"
         func d(_ str: String) -> Date { df.date(from: str) ?? Date() }
-        
-        let db: [String: (String, Date)] = [
+
+        return [
             // Mac Apple Silicon
             "MacBookAir10,1": ("MacBook Air (M1, 2020)", d("2020-11-17")),
             "MacBookPro17,1": ("MacBook Pro 13\" (M1, 2020)", d("2020-11-17")),
@@ -558,8 +558,11 @@ enum AppleModelDatabase {
             "iPhone10,3": ("iPhone X", d("2017-11-03")),
             "iPhone10,6": ("iPhone X", d("2017-11-03"))
         ]
-        
-        return db[clean]
+    }()
+
+    static func lookupReleaseDate(model: String) -> (marketingName: String, releaseDate: Date)? {
+        let clean = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        return releaseDateTable[clean]
     }
     
     static func lookupBatterySpecs(model: String) -> (mah: Int, wh: Double) {
@@ -811,7 +814,8 @@ struct DeviceBatteryData: Codable, Identifiable, Equatable {
             && amperageMa == o.amperageMa
             && abs((chargingWatts ?? 0) - (o.chargingWatts ?? 0)) < 0.15
             && abs((ratePctPerHour ?? 0) - (o.ratePctPerHour ?? 0)) < 0.15
-            && abs((temperatureC ?? -999) - (o.temperatureC ?? -999)) < 0.15
+            && (temperatureC == nil) == (o.temperatureC == nil)
+            && abs((temperatureC ?? 0) - (o.temperatureC ?? 0)) < 0.05
             && tempTrend == o.tempTrend
             && timeRemainingMins == o.timeRemainingMins
             && remainingMah == o.remainingMah
@@ -858,6 +862,7 @@ enum MacBatteryReader {
         var bootDate: Date
     }
 
+    private static let stateLock = NSLock()
     private static var cached: StaticInfo?
     private static var lastTempC: Double?
 
@@ -933,12 +938,12 @@ enum MacBatteryReader {
             ?? signedMilli(packData["InstantAmperage"])
             ?? signedMilli(packData["Amperage"])
 
-        var tempC = lastTempC
+        var tempC: Double? = stateLock.withLock { lastTempC }
         if let rawT = asInt(packData["Temperature"]) ?? asInt(packData["VirtualTemperature"]) ?? asInt(battData["Temperature"]) {
             let raw = Double(rawT)
             let packC = raw > 100 ? (raw / 100.0 * 10).rounded() / 10 : raw
             tempC = LiveBatteryThermometer.reading(near: packC) ?? packC
-            lastTempC = tempC
+            stateLock.withLock { lastTempC = tempC }
         }
 
         let extChargeCapable = asBool(batt["ExternalChargeCapable"])
@@ -948,11 +953,9 @@ enum MacBatteryReader {
 
         let hvc = asInt(adapter["UsbHvcHvcIndex"]) ?? 0
         let negotiatedmV = asInt(adapter["AdapterVoltage"]) ?? 0
-        let inputmV = negotiatedmV
         let detectedWatts = asInt(adapter["Watts"])
-        let inputV = Double(inputmV) / 1000.0
         let negotiatedV = Double(negotiatedmV) / 1000.0
-        let detectedV = inputV > 1 ? inputV : (negotiatedV > 1 ? negotiatedV : nil)
+        let detectedV = negotiatedV > 1 ? negotiatedV : nil
 
         let isRealPDContract = extChargeCapable && ((detectedWatts ?? 0) >= 10 || (detectedV ?? 0) >= 8.5 || (1...3).contains(hvc))
 
@@ -977,7 +980,20 @@ enum MacBatteryReader {
             : firstInt(["AvgTimeToEmpty"], in: [batt, battData])
         let cleanTimeRem = (timeRem ?? 65535) >= 60000 ? nil : timeRem
 
-        if cached == nil {
+        let ident: StaticInfo = {
+            if let existing = stateLock.withLock({ cached }) {
+                if Date().timeIntervalSince(existing.diskAt) >= 60,
+                   let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/") {
+                    var updated = existing
+                    updated.totalDisk = (attrs[.systemSize] as? NSNumber)?.int64Value
+                    updated.freeDisk = (attrs[.systemFreeSize] as? NSNumber)?.int64Value
+                    updated.diskAt = Date()
+                    stateLock.withLock { cached = updated }
+                    return updated
+                }
+                return existing
+            }
+
             var chipName = "Apple Silicon"
             var sysctlBuf = [CChar](repeating: 0, count: 128)
             var sysctlSize = sysctlBuf.count
@@ -1053,7 +1069,7 @@ enum MacBatteryReader {
                 freeDisk = (attrs[.systemFreeSize] as? NSNumber)?.int64Value
             }
 
-            cached = StaticInfo(
+            let created = StaticInfo(
                 chipName: chipName,
                 hwModelName: hwModelName,
                 serialNum: serialNum,
@@ -1068,18 +1084,9 @@ enum MacBatteryReader {
                 diskAt: Date(),
                 bootDate: Date().addingTimeInterval(-ProcessInfo.processInfo.systemUptime)
             )
-        }
-
-        if var info = cached, Date().timeIntervalSince(info.diskAt) >= 60 {
-            if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/") {
-                info.totalDisk = (attrs[.systemSize] as? NSNumber)?.int64Value
-                info.freeDisk = (attrs[.systemFreeSize] as? NSNumber)?.int64Value
-                info.diskAt = Date()
-                cached = info
-            }
-        }
-
-        let ident = cached!
+            stateLock.withLock { cached = created }
+            return created
+        }()
 
         var pdOn: Bool? = nil
         var pdVolts: Double? = nil
@@ -1875,18 +1882,38 @@ def run():
             
         ss_resp = send_lockdown(s, {'Request': 'StartSession', 'HostID': pair_rec['HostID'], 'SystemBUID': pair_rec['SystemBUID'], 'Label': 'BW'})
         
+        def build_ssl_ctx():
+            c_p = None
+            k_p = None
+            try:
+                with tempfile.NamedTemporaryFile('wb', delete=False) as f_c, tempfile.NamedTemporaryFile('wb', delete=False) as f_k:
+                    f_c.write(pair_rec['HostCertificate'])
+                    f_k.write(pair_rec['HostPrivateKey'])
+                    c_p, k_p = f_c.name, f_k.name
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                ssl_ctx.load_cert_chain(c_p, k_p)
+                return ssl_ctx
+            finally:
+                for tmp_p in (c_p, k_p):
+                    if tmp_p and os.path.exists(tmp_p):
+                        os.unlink(tmp_p)
+
+        def normalize_temp(v):
+            if v is None:
+                return None
+            fv = float(v)
+            if fv > 1000:
+                return round(fv / 100.0, 1)
+            if fv > 100:
+                return round(fv / 10.0, 1)
+            return round(fv, 1)
+
+        ctx = None
         sock_to_use = s
         if ss_resp.get('EnableSessionSSL'):
-            with tempfile.NamedTemporaryFile('wb', delete=False) as f_c, tempfile.NamedTemporaryFile('wb', delete=False) as f_k:
-                f_c.write(pair_rec['HostCertificate'])
-                f_k.write(pair_rec['HostPrivateKey'])
-                c_p, k_p = f_c.name, f_k.name
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            ctx.load_cert_chain(c_p, k_p)
-            os.unlink(c_p)
-            os.unlink(k_p)
+            ctx = build_ssl_ctx()
             sock_to_use = ctx.wrap_socket(s)
             sock_to_use.settimeout(1.8)
             
@@ -1900,7 +1927,7 @@ def run():
         amperage = None
         watts = None
         time_rem = None
-        temp = batt_info.get('BatteryTemperature') or batt_info.get('Temperature')
+        temp = normalize_temp(batt_info['BatteryTemperature'] if batt_info.get('BatteryTemperature') is not None else batt_info.get('Temperature'))
         rem_mah = None
         fcc_mah = None
         des_mah = None
@@ -1924,6 +1951,8 @@ def run():
                     
                     diag_sock = s_diag
                     if diag_serv.get('EnableServiceSSL'):
+                        if ctx is None:
+                            ctx = build_ssl_ctx()
                         diag_sock = ctx.wrap_socket(s_diag)
                         diag_sock.settimeout(1.5)
                         
@@ -1932,10 +1961,10 @@ def run():
                     pack_reg = pack_res.get('Diagnostics', {}).get('IORegistry', {})
                     bdata = pack_reg.get('BatteryData', {})
                     
-                    # Temperature is in centidegrees (e.g. 4179 -> 41.79 °C)
-                    raw_temp = bdata.get('Temperature') or bdata.get('VirtualTemperature')
-                    if raw_temp:
-                        temp = round(float(raw_temp) / 100.0, 1) if raw_temp > 100 else float(raw_temp)
+                    # Temperature is in decidegrees or centidegrees (e.g. 4179 -> 41.8 °C, 325 -> 32.5 °C)
+                    raw_temp = bdata.get('Temperature') if bdata.get('Temperature') is not None else bdata.get('VirtualTemperature')
+                    if raw_temp is not None:
+                        temp = normalize_temp(raw_temp)
                     
                     cycles = bdata.get('CycleCount') or pack_reg.get('CycleCount')
                     voltage = bdata.get('Voltage') or pack_reg.get('Voltage')
@@ -1996,11 +2025,12 @@ def run():
         except Exception as e:
             pass
             
-        if not temp:
+        if temp is None:
             # Check for any direct thermal readings in reg
-            temp = reg.get('BatteryTemperature') or reg.get('Temperature') or reg.get('AppleRawBatteryTemperature')
-            if temp and temp > 100:
-                temp = round(temp / 100.0, 1) if temp > 1000 else round(temp / 10.0, 1)
+            for k in ('BatteryTemperature', 'Temperature', 'AppleRawBatteryTemperature'):
+                if reg.get(k) is not None:
+                    temp = normalize_temp(reg.get(k))
+                    break
 
         res = {
             'udid': dev_udid,
@@ -2417,15 +2447,19 @@ run()
 struct LidSession: Identifiable, Codable, Equatable {
     var id: String { "\(openDate.timeIntervalSince1970)_\(closeDate?.timeIntervalSince1970 ?? 0)" }
 
-    /// One session per open time, newest first. A later entry wins, and a closed one beats an open one.
+    /// One session per open time, newest first. Closed sessions win over open ones, and superseded open entries are dropped.
     static func deduplicated(_ sessions: [LidSession]) -> [LidSession] {
         var byOpen: [Int: LidSession] = [:]
         for s in sessions {
+            if let close = s.closeDate, close < s.openDate { continue }
             let key = Int(s.openDate.timeIntervalSince1970)
             if let kept = byOpen[key], kept.closeDate != nil, s.closeDate == nil { continue }
             byOpen[key] = s
         }
-        return byOpen.values.sorted(by: { $0.openDate > $1.openDate })
+        let sorted = byOpen.values.sorted(by: { $0.openDate > $1.openDate })
+        return sorted.enumerated().compactMap { idx, s in
+            (idx > 0 && s.closeDate == nil) ? nil : s
+        }
     }
     let openDate: Date
     let closeDate: Date? // nil if currently open / active
@@ -2450,14 +2484,55 @@ struct LidSession: Identifiable, Codable, Equatable {
     }
 }
 
-final class MacLidTracker {
+final class MacLidTracker: Sendable {
     static let shared = MacLidTracker()
+
+    private static let formatterLock = NSLock()
+    private static let pmsetQueryDF: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.calendar = Calendar(identifier: .gregorian)
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return df
+    }()
+    private static let pmsetZoneDF: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.calendar = Calendar(identifier: .gregorian)
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+        return df
+    }()
+
+    static func formatPmsetStart(_ date: Date) -> String {
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
+        pmsetQueryDF.timeZone = TimeZone.autoupdatingCurrent
+        return pmsetQueryDF.string(from: date)
+    }
+
+    static func parsePmsetTimestamp(_ line: String) -> Date? {
+        let utf8 = Array(line.utf8)
+        guard utf8.count >= 19 else { return nil }
+        let hasZone = utf8.count >= 25
+            && utf8[19] == 0x20
+            && (utf8[20] == 0x2B || utf8[20] == 0x2D)
+            && utf8[21...24].allSatisfy { $0 >= 0x30 && $0 <= 0x39 }
+        formatterLock.lock()
+        defer { formatterLock.unlock() }
+        if hasZone {
+            let str = String(decoding: utf8[0..<25], as: UTF8.self)
+            if let dt = pmsetZoneDF.date(from: str) { return dt }
+        }
+        pmsetQueryDF.timeZone = TimeZone.autoupdatingCurrent
+        let shortStr = String(decoding: utf8[0..<19], as: UTF8.self)
+        return pmsetQueryDF.date(from: shortStr)
+    }
 
     /// Returns the start Date of the current day cycle using a 5:00 AM cutoff.
     /// If current time is >= 5:00 AM, the cycle started at 5:00 AM today.
     /// If current time is < 5:00 AM, the cycle started at 5:00 AM yesterday.
     static func lidCycleStartDate(for date: Date = Date(), cutoffHour: Int = 5) -> Date {
-        let cal = Calendar.current
+        let cal = Calendar.autoupdatingCurrent
         let hour = cal.component(.hour, from: date)
         let baseDate: Date
         if hour >= cutoffHour {
@@ -2471,24 +2546,20 @@ final class MacLidTracker {
     /// Determines if a given date falls within the current day cycle starting at 5:00 AM.
     static func isDateInCurrentLidDayCycle(_ date: Date, referenceDate: Date = Date(), cutoffHour: Int = 5) -> Bool {
         let cycleStart = lidCycleStartDate(for: referenceDate, cutoffHour: cutoffHour)
-        let cycleEnd = Calendar.current.date(byAdding: .day, value: 1, to: cycleStart) ?? referenceDate
+        let cycleEnd = Calendar.autoupdatingCurrent.date(byAdding: .day, value: 1, to: cycleStart) ?? referenceDate
         return date >= cycleStart && date < cycleEnd
     }
 
     /// Determines if a given date falls within the previous day cycle (yesterday 5:00 AM to today 5:00 AM).
     static func isDateInPreviousLidDayCycle(_ date: Date, referenceDate: Date = Date(), cutoffHour: Int = 5) -> Bool {
         let currentCycleStart = lidCycleStartDate(for: referenceDate, cutoffHour: cutoffHour)
-        let prevCycleStart = Calendar.current.date(byAdding: .day, value: -1, to: currentCycleStart) ?? referenceDate
+        let prevCycleStart = Calendar.autoupdatingCurrent.date(byAdding: .day, value: -1, to: currentCycleStart) ?? referenceDate
         return date >= prevCycleStart && date < currentCycleStart
     }
 
     func fetchAllLidSessions() -> [LidSession] {
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        df.timeZone = TimeZone.current
-
-        let sevenDaysAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
-        let startStr = df.string(from: sevenDaysAgo)
+        let sevenDaysAgo = Calendar.autoupdatingCurrent.date(byAdding: .day, value: -7, to: Date()) ?? Date()
+        let startStr = Self.formatPmsetStart(sevenDaysAgo)
 
         // Run pmset directly, not through `sh`, so a timeout kills pmset itself.
         // pmset itself takes about 3 s of CPU, so callers must not run this often.
@@ -2498,7 +2569,7 @@ final class MacLidTracker {
 
         // The log is ~9 MB (pmset ignores --start). Scan raw bytes with memchr/memmem and only build
         // Strings for the few hundred matching lines; String matching over all of it cost seconds of CPU.
-        let lidNeedles = ["com.apple.powermanagement.lidopen", "Clamshell Sleep"].map { Array($0.utf8) }
+        let lidNeedles = ["com.apple.powermanagement.lidopen", "Clamshell Sleep", "Entering Sleep"].map { Array($0.utf8) }
         let bootNeedle = Array("powerd process is started".utf8)
         var output: [String] = []
         // A shutdown logs nothing of its own. The last entry before each boot is when the Mac went off.
@@ -2506,7 +2577,7 @@ final class MacLidTracker {
         outputData.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             guard let base = raw.baseAddress else { return }
             let total = raw.count
-            // "yyyy-MM-dd HH:mm:ss" sorts correctly as bytes, so timestamps compare without parsing.
+            // "yyyy-MM-dd HH:mm:ss" sorts correctly as bytes within the same UTC offset; parse across offset switches.
             var lastSeen: [UInt8]?
             var start = 0
             while start < total {
@@ -2515,16 +2586,40 @@ final class MacLidTracker {
                 defer { start = end + 1 }
                 guard len >= 19, base.load(fromByteOffset: start, as: UInt8.self) == 0x32 else { continue }   // "2" of the year
                 let line = base + start
-                let stamp = Array(UnsafeRawBufferPointer(start: line, count: 19))
+                var stampLen = 19
+                if len >= 25 {
+                    let sp = base.load(fromByteOffset: start + 19, as: UInt8.self)
+                    let sign = base.load(fromByteOffset: start + 20, as: UInt8.self)
+                    if sp == 0x20 && (sign == 0x2B || sign == 0x2D) {
+                        var digitsOK = true
+                        for idx in 21...24 {
+                            let c = base.load(fromByteOffset: start + idx, as: UInt8.self)
+                            if c < 0x30 || c > 0x39 { digitsOK = false; break }
+                        }
+                        if digitsOK { stampLen = 25 }
+                    }
+                }
+                let stamp = Array(UnsafeRawBufferPointer(start: line, count: stampLen))
                 let isBoot = memmem(line, len, bootNeedle, bootNeedle.count) != nil
+                let stampIsNewer: ([UInt8], [UInt8]) -> Bool = { prev, cur in
+                    if prev.count == 25, cur.count == 25, prev[20..<25] == cur[20..<25] {
+                        return prev[0..<19].lexicographicallyPrecedes(cur[0..<19])
+                    }
+                    if let d1 = Self.parsePmsetTimestamp(String(decoding: prev, as: UTF8.self)),
+                       let d2 = Self.parsePmsetTimestamp(String(decoding: cur, as: UTF8.self)) {
+                        return d1 < d2
+                    }
+                    return prev.lexicographicallyPrecedes(cur)
+                }
                 if isBoot {
-                    if let last = lastSeen, last.lexicographicallyPrecedes(stamp),
-                       let off = df.date(from: String(decoding: last, as: UTF8.self)),
-                       let boot = df.date(from: String(decoding: stamp, as: UTF8.self)) {
+                    if let last = lastSeen,
+                       let off = Self.parsePmsetTimestamp(String(decoding: last, as: UTF8.self)),
+                       let boot = Self.parsePmsetTimestamp(String(decoding: stamp, as: UTF8.self)),
+                       off < boot {
                         shutdownBeforeBoot[boot] = off
                     }
                     lastSeen = nil
-                } else if lastSeen.map({ $0.lexicographicallyPrecedes(stamp) }) ?? true {
+                } else if lastSeen.map({ stampIsNewer($0, stamp) }) ?? true {
                     lastSeen = stamp
                 }
                 if isBoot || lidNeedles.contains(where: { memmem(line, len, $0, $0.count) != nil }) {
@@ -2537,9 +2632,7 @@ final class MacLidTracker {
         var rawCloses: [Date] = []
 
         for line in output {
-            guard line.utf8.count >= 19 else { continue }
-            let dateStr = String(line.prefix(19))
-            guard let dt = df.date(from: dateStr) else { continue }
+            guard let dt = Self.parsePmsetTimestamp(line) else { continue }
 
             // A cold boot logs no lidopen or wake, only powerd starting. Count it as the lid opening.
             let isOpen = line.contains("powerd process is started") ||
@@ -2575,6 +2668,9 @@ final class MacLidTracker {
             return []
         }
 
+        rawOpens.sort()
+        rawCloses.sort()
+
         var sessions: [LidSession] = []
         for (idx, op) in rawOpens.enumerated() {
             let nextOp = (idx + 1 < rawOpens.count) ? rawOpens[idx + 1] : nil
@@ -2583,6 +2679,7 @@ final class MacLidTracker {
             if cl == nil, let next = nextOp, let off = shutdownBeforeBoot.first(where: { abs($0.key.timeIntervalSince(next)) < 30 })?.value, off > op {
                 cl = off
             }
+            if cl == nil && nextOp != nil { continue }
             sessions.append(LidSession(openDate: op, closeDate: cl))
         }
 
@@ -2782,7 +2879,6 @@ final class BatteryWidgetViewModel: ObservableObject {
                 self?.liveSessionStart = nil
                 self?.showingBreakReminder = false
                 self?.savePersisted()
-                self?.refreshLidSessions()
             }
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -4009,11 +4105,12 @@ final class USBPortDetector {
 
 // MARK: - CoreAudio Volume Engine (Hardware Level Guaranteed Volume Override)
 
+@MainActor
 final class AudioSystemEngine {
     static let shared = AudioSystemEngine()
     private var originalVolume: Float? = nil
     private var originalMute: Bool? = nil
-    private var restoreWorkItem: DispatchWorkItem?
+    private var restoreTask: Task<Void, Never>?
 
     private func getDefaultOutputDevice() -> AudioDeviceID? {
         var defaultOutputDeviceID = AudioDeviceID(0)
@@ -4087,8 +4184,8 @@ final class AudioSystemEngine {
     /// `action` plays the sound and returns its length. The volume is restored only after it ends;
     /// a fixed 0.8 s cut most chimes (Glass, Pop, Blow run 1.4–1.65 s) in half.
     func playWithFixedVolume(level: Float = 0.5, duration: TimeInterval = 0.8, action: () -> TimeInterval) {
-        restoreWorkItem?.cancel()
-        restoreWorkItem = nil
+        restoreTask?.cancel()
+        restoreTask = nil
 
         let currentVol = getMasterVolume() ?? 0.5
         let currentMute = isMuted()
@@ -4108,8 +4205,9 @@ final class AudioSystemEngine {
         let soundLength = action()
         let holdFor = max(duration, soundLength + 0.15)
 
-        let item = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
+        restoreTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, holdFor) * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
             if let orig = self.originalVolume {
                 self.setMasterVolume(orig)
             }
@@ -4118,15 +4216,14 @@ final class AudioSystemEngine {
             }
             self.originalVolume = nil
             self.originalMute = nil
-            self.restoreWorkItem = nil
+            self.restoreTask = nil
         }
-        self.restoreWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + holdFor, execute: item)
     }
 }
 
 // MARK: - Robust System Sound & Chime Player
 
+@MainActor
 final class WidgetSoundPlayer {
     static let shared = WidgetSoundPlayer()
     private var activePlayers: [AVAudioPlayer] = []
@@ -4157,7 +4254,9 @@ final class WidgetSoundPlayer {
                 player.play()
                 
                 activePlayers.append(player)
-                DispatchQueue.main.asyncAfter(deadline: .now() + max(1.0, player.duration + 0.2)) { [weak self] in
+                let cleanupDelay = max(1.0, player.duration + 0.2)
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(cleanupDelay * 1_000_000_000))
                     self?.activePlayers.removeAll(where: { !$0.isPlaying })
                 }
                 return player.duration
@@ -4173,7 +4272,7 @@ final class WidgetSoundPlayer {
 
 // MARK: - Dedicated System Notification Manager
 
-final class WidgetNotificationManager: NSObject, UNUserNotificationCenterDelegate {
+final class WidgetNotificationManager: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
     static let shared = WidgetNotificationManager()
 
     override init() {
@@ -4220,6 +4319,7 @@ final class WidgetNotificationManager: NSObject, UNUserNotificationCenterDelegat
 
 // MARK: - Stereo Pan Audio Player (Left-to-Right Speaker Sweep)
 
+@MainActor
 final class PanAudioPlayer: NSObject, AVAudioPlayerDelegate {
     private var player: AVAudioPlayer?
     private var timer: Timer?
@@ -4249,16 +4349,18 @@ final class PanAudioPlayer: NSObject, AVAudioPlayerDelegate {
         
         self.timer?.invalidate()
         let t = Timer(timeInterval: 0.016, repeats: true) { [weak self] tm in
-            guard let self, let p = self.player, p.isPlaying else {
-                tm.invalidate()
-                return
-            }
-            let elapsed = ProcessInfo.processInfo.systemUptime - self.startTime
-            let progress = min(1.0, elapsed / self.duration)
-            // Pan smoothly from -1.0 (Left Speaker) to +1.0 (Right Speaker)
-            p.pan = Float(-1.0 + (2.0 * progress))
-            if progress >= 1.0 {
-                tm.invalidate()
+            MainActor.assumeIsolated {
+                guard let self, let p = self.player, p.isPlaying else {
+                    tm.invalidate()
+                    return
+                }
+                let elapsed = ProcessInfo.processInfo.systemUptime - self.startTime
+                let progress = min(1.0, elapsed / self.duration)
+                // Pan smoothly from -1.0 (Left Speaker) to +1.0 (Right Speaker)
+                p.pan = Float(-1.0 + (2.0 * progress))
+                if progress >= 1.0 {
+                    tm.invalidate()
+                }
             }
         }
         RunLoop.main.add(t, forMode: .common)
@@ -4314,16 +4416,42 @@ func formatUptime(_ seconds: Int) -> String {
     return "Up \(max(1, m))m"
 }
 
-func formatTimeShort(_ d: Date) -> String {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm"
-    return f.string(from: d)
+@MainActor
+private enum IBWDateFormats {
+    private static func make(_ format: String) -> DateFormatter {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.autoupdatingCurrent
+        f.calendar = cal
+        f.timeZone = TimeZone.autoupdatingCurrent
+        f.dateFormat = format
+        return f
+    }
+
+    static let timeShort = make("HH:mm")
+    static let timeFull = make("HH:mm:ss")
+    static let hourLabel = make("HH:00")
+    static let isoDay = make("yyyy-MM-dd")
+    static let dayMonth = make("d MMM")
+    static let monthYear = make("MMM yyyy")
+    static let dayMonthYear = make("d MMM yyyy")
+    static let dayMonthYearTime = make("d MMM yyyy, HH:mm")
+    static let dayMonthYearTimeSeconds = make("d MMM yyyy, HH:mm:ss")
+    static let weekdayShort = make("EEE")
+    static let weekdayDayMonthYear = make("EEE, d MMM yyyy")
+    static let fullWeekdayDayMonthYear = make("EEEE, d MMM yyyy")
+    static let coconutTimestamp = make("dd/MM/yyyy, HH:mm")
 }
 
+@MainActor
+func formatTimeShort(_ d: Date) -> String {
+    IBWDateFormats.timeShort.string(from: d)
+}
+
+@MainActor
 func formatTimeFull(_ d: Date) -> String {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss"
-    return f.string(from: d)
+    IBWDateFormats.timeFull.string(from: d)
 }
 
 func quietStampText(_ info: DeviceBatteryData) -> String? {
@@ -5089,15 +5217,11 @@ struct BatteryDegradationGraphCanvas: View {
     }
 
     private func formatXDate(_ d: Date, span: TimeInterval) -> String {
-        let f = DateFormatter()
-        f.dateFormat = span < 70 * 86400 ? "d MMM" : "MMM yyyy"
-        return f.string(from: d)
+        (span < 70 * 86400 ? IBWDateFormats.dayMonth : IBWDateFormats.monthYear).string(from: d)
     }
 
     private func formatTooltipDate(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "d MMM yyyy, HH:mm"
-        return f.string(from: d)
+        IBWDateFormats.dayMonthYearTime.string(from: d)
     }
 }
 
@@ -5183,7 +5307,7 @@ struct DailyTemperatureGraphCanvas: View {
                 // Vertical Time Guide Grid Lines for Full Day
                 if isSingleDay {
                     ForEach([4, 8, 12, 16, 20], id: \.self) { hour in
-                        let hourTime = minT + Double(hour * 3600)
+                        let hourTime = minT + (Double(hour) / 24.0) * (maxT - minT)
                         let gridX = xForTime(hourTime, minT: minT, maxT: maxT, padL: padL, plotW: plotW)
                         Path { p in
                             p.move(to: CGPoint(x: gridX, y: padT))
@@ -5268,7 +5392,7 @@ struct DailyTemperatureGraphCanvas: View {
                     )
 
                     // Data Points / Temperature Dots
-                    ForEach(validPoints) { pt in
+                    ForEach(Array(validPoints.enumerated()), id: \.offset) { _, pt in
                         if let temp = pt.temperatureC {
                             let dotCol = temperatureColor(temp)
                             let isHot = temp >= 38.0
@@ -5424,15 +5548,11 @@ struct DailyTemperatureGraphCanvas: View {
     }
 
     private func formatXDate(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "d MMM"
-        return f.string(from: d)
+        IBWDateFormats.dayMonth.string(from: d)
     }
 
     private func formatTooltipDate(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "d MMM yyyy, HH:mm:ss"
-        return f.string(from: d)
+        IBWDateFormats.dayMonthYearTimeSeconds.string(from: d)
     }
 }
 
@@ -5444,12 +5564,6 @@ struct ModernDataTableRowView: View {
     let activeDeviceModel: String?
     let activeDeviceName: String?
     @State private var hovering = false
-
-    private static let rowDateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "dd/MM/yyyy, HH:mm"
-        return f
-    }()
 
     private func healthColor(_ h: Double) -> Color {
         h >= 90 ? Color(hex: "#30D158") : (h >= 80 ? Color(hex: "#FFD60A") : Color(hex: "#FF453A"))
@@ -5486,7 +5600,7 @@ struct ModernDataTableRowView: View {
                 Circle()
                     .fill(pt.healthPct.map { healthColor($0) } ?? Color(hex: "#0A84FF"))
                     .frame(width: 5, height: 5)
-                Text(Self.rowDateFormatter.string(from: pt.date))
+                Text(IBWDateFormats.coconutTimestamp.string(from: pt.date))
                     .font(.system(size: 11, weight: .medium, design: .rounded))
                     .foregroundColor(.white.opacity(0.92))
             }
@@ -5660,9 +5774,7 @@ private struct SnapshotDayDetail: View {
     }
 
     private func timeText(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "HH:00"
-        return f.string(from: date)
+        IBWDateFormats.hourLabel.string(from: date)
     }
 
     private func chargeText(_ pt: BatteryHistoryPoint) -> String {
@@ -5681,9 +5793,7 @@ struct DailyTempTableRowView: View {
     let onSelect: () -> Void
 
     private func formatDayLabel(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "EEE, d MMM yyyy"
-        return f.string(from: d)
+        IBWDateFormats.weekdayDayMonthYear.string(from: d)
     }
 
     var body: some View {
@@ -6009,10 +6119,6 @@ struct BatteryHistoryChartView: View {
         return list
     }
 
-    private var currentPhoneId: String? {
-        historyDevices.first(where: { $0.deviceType != .mac })?.deviceId
-    }
-
     private var activeDevice: DeviceBatteryData? {
         historyDevices.first(where: { $0.id == selectedDevId }) ?? historyDevices.first
     }
@@ -6204,14 +6310,14 @@ struct BatteryHistoryChartView: View {
         return ui.snapshotsByDay[snapshotDayKey(date)] ?? []
     }
 
-    private var activePhoneIsNew18: Bool {
-        guard let dev = activeDevice, dev.deviceType != .mac else { return false }
-        return phoneGroupKey(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel) == "iphone-18-pro"
+    private var hasShortLog: Bool {
+        let dates = matchedPoints.map(\.date)
+        guard let lo = dates.min(), let hi = dates.max() else { return false }
+        return hi.timeIntervalSince(lo) < 7 * 86400
     }
 
-    /// The 18 Pro log is only a few days old, so its chart stays on that window.
     private var effectiveGraphRange: GraphRange {
-        activePhoneIsNew18 ? .fewDays : selectedGraphRange
+        hasShortLog ? .fewDays : selectedGraphRange
     }
 
     private var graphPoints: [BatteryHistoryPoint] {
@@ -6233,9 +6339,9 @@ struct BatteryHistoryChartView: View {
         return (start, end)
     }
 
-    /// Month buttons describe the current iPhone. The retired phone is drawn at those same cycle numbers.
+    /// Range buttons describe the selected iPhone. The overlaid phone is drawn at those same cycle numbers.
     private func overlaySeries(for other: DeviceBatteryData) -> (current: [BatteryHistoryPoint], retired: [BatteryHistoryPoint]) {
-        let phone = historyDevices.first { $0.deviceType != .mac && $0.deviceId == currentPhoneId }
+        let phone = activeDevice.flatMap { $0.deviceType == .mac ? nil : $0 }
         let currentAll = (phone.map { pointsFor($0) } ?? []).sorted { $0.date < $1.date }
         let retiredAll = pointsFor(other)
         if let days = effectiveGraphRange.days {
@@ -6468,7 +6574,14 @@ struct BatteryHistoryChartView: View {
                         let count = pointsFor(dev).count
                         let isRetired = isArchivedPhone(deviceId: dev.deviceId, serial: dev.serialNumber, name: dev.deviceName, model: dev.hardwareModel)
 
-                        Button(action: { selectedDevId = dev.id }) {
+                        Button(action: {
+                            selectedDevId = dev.id
+                            selectedCustomDateKey = nil
+                            selectedSnapshotDayKey = nil
+                            if compareDeviceId == dev.deviceId {
+                                compareDeviceId = nil
+                            }
+                        }) {
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 5) {
                                     Image(systemName: dev.deviceType.iconName)
@@ -6601,7 +6714,7 @@ struct BatteryHistoryChartView: View {
                 }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("IBWOpenLidHistoryTab"))) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("IBWSelectLidSessionsTab"))) { _ in
             withAnimation(.easeInOut(duration: 0.2)) {
                 self.activeTab = .lidSessions
             }
@@ -6773,27 +6886,22 @@ struct BatteryHistoryChartView: View {
         let now = Date()
         let horizon = sampleHorizon
 
-        if let customKey = selectedCustomDateKey {
-            let df = DateFormatter()
-            df.dateFormat = "yyyy-MM-dd"
-            if let d = df.date(from: customKey) {
-                let s = cal.startOfDay(for: d)
-                let e = s.addingTimeInterval(86400)
-                let titleFmt = DateFormatter()
-                titleFmt.dateFormat = "EEEE, d MMM yyyy"
-                return (s, e, true, titleFmt.string(from: d))
-            }
+        if let customKey = selectedCustomDateKey,
+           let d = IBWDateFormats.isoDay.date(from: customKey) {
+            let s = cal.startOfDay(for: d)
+            let e = cal.date(byAdding: .day, value: 1, to: s) ?? s.addingTimeInterval(86400)
+            return (s, e, true, IBWDateFormats.fullWeekdayDayMonthYear.string(from: d))
         }
 
         switch selectedTempSection {
         case .today:
             let s = cal.startOfDay(for: now)
-            let e = s.addingTimeInterval(86400)
+            let e = cal.date(byAdding: .day, value: 1, to: s) ?? s.addingTimeInterval(86400)
             return (s, e, true, "Today (Full 24h Timeline)")
         case .yesterday:
             let yest = cal.date(byAdding: .day, value: -1, to: now) ?? now.addingTimeInterval(-86400)
             let s = cal.startOfDay(for: yest)
-            let e = s.addingTimeInterval(86400)
+            let e = cal.date(byAdding: .day, value: 1, to: s) ?? s.addingTimeInterval(86400)
             return (s, e, true, "Yesterday (Full 24h Timeline)")
         case .last7:
             let s = cal.date(byAdding: .day, value: -7, to: horizon) ?? horizon.addingTimeInterval(-7*86400)
@@ -7073,9 +7181,7 @@ struct BatteryHistoryChartView: View {
     }
 
     private func formatDayLabel(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "EEE, d MMM yyyy"
-        return f.string(from: d)
+        IBWDateFormats.weekdayDayMonthYear.string(from: d)
     }
 
     // MARK: - Monthly Summary Tab
@@ -7227,7 +7333,7 @@ struct BatteryHistoryChartView: View {
 
     private var graphRangePills: some View {
         HStack(spacing: 4) {
-            ForEach(activePhoneIsNew18 ? [GraphRange.fewDays] : GraphRange.allCases.filter { $0 != .fewDays }, id: \.self) { range in
+            ForEach(hasShortLog ? [GraphRange.fewDays] : GraphRange.allCases, id: \.self) { range in
                 let isSelected = effectiveGraphRange == range
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) {
@@ -7592,36 +7698,21 @@ struct LidWeeklyUsageGraphView: View {
 
     private func computeWeekData() -> (rangeTitle: String, days: [LidDayUsage], totalWeekSeconds: TimeInterval, dailyAvgSeconds: TimeInterval, peakDay: LidDayUsage?, activeDaysCount: Int) {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone.current
+        cal.timeZone = TimeZone.autoupdatingCurrent
         cal.firstWeekday = 2 // Monday start
         let now = Date()
+        let baseCycle = MacLidTracker.lidCycleStartDate(for: now)
 
         let anchorDate: Date
         if weekOffset == 0 {
-            anchorDate = now
+            anchorDate = baseCycle
         } else {
-            anchorDate = cal.date(byAdding: .weekOfYear, value: weekOffset, to: now) ?? now
+            anchorDate = cal.date(byAdding: .weekOfYear, value: weekOffset, to: baseCycle) ?? baseCycle
         }
 
         guard let interval = cal.dateInterval(of: .weekOfYear, for: anchorDate) else {
             return ("Week", [], 0, 0, nil, 0)
         }
-
-        let dfShort = DateFormatter()
-        dfShort.dateFormat = "d MMM"
-        dfShort.timeZone = TimeZone.current
-
-        let dfFull = DateFormatter()
-        dfFull.dateFormat = "EEEE, d MMM yyyy"
-        dfFull.timeZone = TimeZone.current
-
-        let dfDayOfWeek = DateFormatter()
-        dfDayOfWeek.dateFormat = "EEE"
-        dfDayOfWeek.timeZone = TimeZone.current
-
-        let dfKey = DateFormatter()
-        dfKey.dateFormat = "yyyy-MM-dd"
-        dfKey.timeZone = TimeZone.current
 
         var days: [LidDayUsage] = []
         var totalSec: TimeInterval = 0
@@ -7630,9 +7721,8 @@ struct LidWeeklyUsageGraphView: View {
         let weekStartDay = interval.start
         let weekEndDay = cal.date(byAdding: .day, value: 6, to: weekStartDay) ?? weekStartDay
 
-        let rangeTitle: String
         let weekLabel = weekOffset == 0 ? " (This Week)" : (weekOffset == -1 ? " (Last Week)" : "")
-        rangeTitle = "\(dfShort.string(from: weekStartDay)) – \(dfShort.string(from: weekEndDay))\(weekLabel)"
+        let rangeTitle = "\(IBWDateFormats.dayMonth.string(from: weekStartDay)) – \(IBWDateFormats.dayMonth.string(from: weekEndDay))\(weekLabel)"
 
         for i in 0..<7 {
             guard let dayDate = cal.date(byAdding: .day, value: i, to: weekStartDay) else { continue }
@@ -7646,16 +7736,16 @@ struct LidWeeklyUsageGraphView: View {
             totalSec += daySec
             if daySec > 60 { activeCount += 1 }
 
-            let isToday = MacLidTracker.isDateInCurrentLidDayCycle(dayDate)
+            let isToday = MacLidTracker.isDateInCurrentLidDayCycle(dayStart, referenceDate: now)
             let hasActiveSession = daySessions.contains { $0.isActive }
 
-            let key = dfKey.string(from: dayDate)
+            let key = IBWDateFormats.isoDay.string(from: dayStart)
             days.append(LidDayUsage(
                 dateKey: key,
                 date: dayDate,
-                dayOfWeek: dfDayOfWeek.string(from: dayDate),
-                dayNumber: dfShort.string(from: dayDate),
-                fullDateString: dfFull.string(from: dayDate),
+                dayOfWeek: IBWDateFormats.weekdayShort.string(from: dayDate),
+                dayNumber: IBWDateFormats.dayMonth.string(from: dayDate),
+                fullDateString: IBWDateFormats.fullWeekdayDayMonthYear.string(from: dayDate),
                 totalSeconds: daySec,
                 sessionCount: daySessions.count,
                 sessions: daySessions,
@@ -8053,13 +8143,9 @@ struct LidWeeklyUsageGraphView: View {
         let all = vm.allLidSessions.isEmpty ? vm.todayLidSessions : vm.allLidSessions
 
         if let selectedKey = selectedLidDayKey {
-            let dfKey = DateFormatter()
-            dfKey.dateFormat = "yyyy-MM-dd"
-            dfKey.timeZone = TimeZone.current
-
             return all.filter { session in
                 let cycleStart = MacLidTracker.lidCycleStartDate(for: session.openDate)
-                return dfKey.string(from: cycleStart) == selectedKey
+                return IBWDateFormats.isoDay.string(from: cycleStart) == selectedKey
             }
         }
 
@@ -9149,9 +9235,7 @@ struct LidWeeklyUsageGraphView: View {
     }
 
     private func formatDateCoconut(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "dd/MM/yyyy, HH:mm"
-        return f.string(from: d)
+        IBWDateFormats.coconutTimestamp.string(from: d)
     }
 }
 final class DraggableVisualEffectView: NSVisualEffectView {
@@ -9236,12 +9320,16 @@ struct WindowDragModifier: ViewModifier {
 @MainActor
 struct LidSessionsPopoverView: View {
     @ObservedObject var vm: BatteryWidgetViewModel
+    @Environment(\.dismiss) private var dismiss
 
     private var totalActiveSeconds: TimeInterval {
         vm.todayLidSessions.reduce(0) { $0 + $1.durationSeconds }
     }
 
     private var totalActiveFormatted: String {
+        if vm.todayLidSessions.isEmpty {
+            return "0m"
+        }
         let sec = Int(totalActiveSeconds)
         let h = sec / 3600
         let m = (sec % 3600) / 60
@@ -9329,6 +9417,7 @@ struct LidSessionsPopoverView: View {
             Divider().background(Color.white.opacity(0.12)).padding(.top, 2)
 
             Button(action: {
+                dismiss()
                 NotificationCenter.default.post(name: NSNotification.Name("IBWOpenLidHistoryTab"), object: nil)
             }) {
                 HStack(spacing: 5) {
@@ -9412,21 +9501,12 @@ struct DeviceGridCardView: View {
     }
 
     private func formatDateShort(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "MMM yyyy"
-        return f.string(from: d)
+        IBWDateFormats.monthYear.string(from: d)
     }
 
     private func formatUsageDate(_ d: Date) -> String {
-        let f = DateFormatter()
-        let cal = Calendar.current
-        let comps = cal.dateComponents([.day, .hour, .minute], from: d)
-        if (comps.day ?? 1) != 1 {
-            f.dateFormat = "d MMM yyyy"
-        } else {
-            f.dateFormat = "MMM yyyy"
-        }
-        return f.string(from: d)
+        let comps = Calendar.autoupdatingCurrent.dateComponents([.day], from: d)
+        return ((comps.day ?? 1) != 1 ? IBWDateFormats.dayMonthYear : IBWDateFormats.monthYear).string(from: d)
     }
 
     private func releaseAgeString(from startDate: Date) -> String {
@@ -9892,9 +9972,7 @@ struct BatteryWidgetView: View {
     }
 
     private func formatDateShort(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "MMM yyyy"
-        return f.string(from: d)
+        IBWDateFormats.monthYear.string(from: d)
     }
 
     private func formatRemainingTime(_ mins: Int, isCharging: Bool) -> String {
@@ -10235,8 +10313,8 @@ final class SettingsWindow: NSWindow {
     func openHistoryWindow(initialTab: BatteryHistoryChartView.HistTab = .graph) {
         if let hp = historyPanel {
             raiseHistoryWindow(hp)
-            if initialTab != .graph {
-                NotificationCenter.default.post(name: NSNotification.Name("IBWOpenLidHistoryTab"), object: nil)
+            if initialTab == .lidSessions {
+                NotificationCenter.default.post(name: NSNotification.Name("IBWSelectLidSessionsTab"), object: nil)
             }
             return
         }

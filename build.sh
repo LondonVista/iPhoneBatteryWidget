@@ -41,18 +41,32 @@ swiftc $OPT_FLAG -j 8 -parse-as-library \
   -target arm64-apple-macos14
 
 chmod +x "$BIN/iPhoneBatteryWidget"
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+rm -rf "$APP/Contents/_CodeSignature"
+xattr -cr "$APP" 2>/dev/null || true
+codesign --force --deep --sign - "$APP"
 
 if [[ -w /Applications ]]; then
+  STAGE_DIR="/Applications/.iPhoneBatteryWidget.staging"
+  STAGE_APP="$STAGE_DIR/iPhoneBatteryWidget.app"
+  BACKUP="/Applications/.iPhoneBatteryWidget.old.app"
+  rm -rf "$STAGE_DIR" "$BACKUP"
+  mkdir -p "$STAGE_DIR"
+  cp -R "$APP" "$STAGE_APP"
+  rm -rf "$STAGE_APP/Contents/_CodeSignature"
+  xattr -cr "$STAGE_APP" 2>/dev/null || true
+  codesign --force --deep --sign - "$STAGE_APP"
+  codesign --verify --deep --strict "$STAGE_APP"
+  if [[ -e /Applications/iPhoneBatteryWidget.app ]]; then
+    mv /Applications/iPhoneBatteryWidget.app "$BACKUP"
+  fi
+  mv "$STAGE_APP" /Applications/iPhoneBatteryWidget.app
+  rm -rf "$STAGE_DIR"
+  echo "✅  Installed → /Applications/iPhoneBatteryWidget.app"
+  # Stop the old process only after the new signed bundle is in place so LaunchAgent KeepAlive never respawns mid-copy.
   pkill -x iPhoneBatteryWidget 2>/dev/null || true
   pkill -f "ClientVersionString': 'bw_1.0'" 2>/dev/null || true
-  sleep 0.2
-  rm -rf /Applications/iPhoneBatteryWidget.app
-  cp -R "$APP" /Applications/iPhoneBatteryWidget.app
-  codesign --force --deep --sign - /Applications/iPhoneBatteryWidget.app 2>/dev/null || true
-  echo "✅  Installed → /Applications/iPhoneBatteryWidget.app"
-  # One instance only: let LaunchAgent respawn, never `open` on top of it.
-  sleep 0.6
+  sleep 0.8
+  rm -rf "$BACKUP"
   if ! pgrep -x iPhoneBatteryWidget >/dev/null; then
     open -a /Applications/iPhoneBatteryWidget.app
   fi
